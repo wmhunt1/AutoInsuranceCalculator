@@ -13,6 +13,7 @@ import os
 import sys
 import argparse
 import re
+import sklearn
 
 import pandas as pd
 import numpy as np
@@ -32,6 +33,7 @@ VALUE_COL_CANDIDATES = [
 # --- UTILITY FUNCTIONS ---
 
 def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    """Tries to find the correct column name (case-insensitive) from a list of candidates."""
     cols_lower = {c.lower(): c for c in columns}
     for cand in candidates:
         if cand.lower() in cols_lower:
@@ -39,6 +41,7 @@ def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     return None
 
 def parse_args():
+    """Handles command line arguments for file, display limits, and device filtering."""
     p = argparse.ArgumentParser(description="Read Telematicsdata.csv and display rows.")
     p.add_argument("--file", "-f", default="Telematicsdata.csv", help="Path to CSV file")
     p.add_argument("--head", "-n", type=int, default=20, help="Number of rows to show (use 0 for all)")
@@ -47,6 +50,7 @@ def parse_args():
     return p.parse_args()
 
 def load_csv(path: str) -> pd.DataFrame:
+    """Loads the CSV file and performs basic error checking."""
     if not os.path.exists(path):
         print(f"Error: file not found: {path}", file=sys.stderr)
         sys.exit(2)
@@ -60,21 +64,21 @@ def load_csv(path: str) -> pd.DataFrame:
     return df
 
 def pick_device_column(df: pd.DataFrame) -> Optional[str]:
+    """Wrapper to find the device ID column."""
     return find_column(df.columns.tolist(), DEVICE_COL_CANDIDATES)
 
 def filter_by_device(df: pd.DataFrame, device_col: str, device_id: str) -> pd.DataFrame:
-    # Compare as string to be robust to numeric/string mismatch
+    """Filters the DataFrame down to a single device ID."""
     return df[df[device_col].astype(str) == str(device_id)].copy()
 
 def filter_by_variable(df: pd.DataFrame, variable_col: str, variable_name: str) -> pd.DataFrame:
-    """Filters the DataFrame to include only rows where the variable column matches a specific name."""
+    """Filters the DataFrame to include only rows matching a specific variable name (e.g., 'POSITION')."""
     filtered_df = df[df[variable_col].astype(str).str.upper() == variable_name.upper()].copy()
     return filtered_df
 
 def select_columns(df: pd.DataFrame, cols_arg: Optional[str]) -> List[str]:
-    if not cols_arg:
-        return df.columns.tolist()
-    if cols_arg.strip().lower() == "all":
+    """Selects columns for display based on user input."""
+    if not cols_arg or cols_arg.strip().lower() == "all":
         return df.columns.tolist()
     chosen = [c.strip() for c in cols_arg.split(",") if c.strip()]
     missing = [c for c in chosen if c not in df.columns]
@@ -85,8 +89,8 @@ def select_columns(df: pd.DataFrame, cols_arg: Optional[str]) -> List[str]:
 
 def extract_lat_lon_and_remove_value(df: pd.DataFrame, value_col: str) -> None:
     """
-    Extract the first two tokens from the value column into 'latitude' and 'longitude'.
-    Modifies df in place.
+    Splits the 'value' column (e.g., "13.33,74.74") into separate 'latitude' and 'longitude' columns.
+    Converts values to numeric, coercing errors to NaN.
     """
     parts = df[value_col].astype(str).str.split(r'[,;\s]+', n=2, expand=True)
     df["latitude"] = pd.to_numeric(parts.iloc[:, 0], errors="coerce")
@@ -100,7 +104,7 @@ def extract_lat_lon_and_remove_value(df: pd.DataFrame, value_col: str) -> None:
         pass
 
 def retrieve_data(value: str) -> tuple[pd.DataFrame, str | None]:
-    """Loads, filters, and prepares the DataFrame for display."""
+    """Handles loading, filtering by 'POSITION', and coordinate extraction."""
     args = parse_args()
     df = load_csv(args.file)
 
@@ -129,9 +133,10 @@ def retrieve_data(value: str) -> tuple[pd.DataFrame, str | None]:
     return df, device_col
 
 def display_data(df: pd.DataFrame, device_col: str | None) -> None:
-    """Displays the processed DataFrame, potentially filtered and sampled."""
+    """Displays the final DataFrame result to the console."""
     args = parse_args()
 
+    # Information about device IDs for non-filtered views
     if device_col and not args.device:
         unique = df[device_col].dropna().unique()
         sample = list(map(str, unique[:10]))
@@ -143,6 +148,7 @@ def display_data(df: pd.DataFrame, device_col: str | None) -> None:
     cols = select_columns(df, args.columns)
     to_show = df[cols]
 
+    # Use to_string() for full, non-truncated table output
     if args.head == 0:
         try:
             print(to_show.to_string(index=False))
@@ -153,30 +159,36 @@ def display_data(df: pd.DataFrame, device_col: str | None) -> None:
 
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """
-    Calculate the great-circle distance (km) between two points on the Earth.
+    Calculates the great-circle distance (in km) between two latitude/longitude points.
+    This is essential for finding the distance traveled between two GPS fixes.
     """
+    # Convert degrees to radians
     lat1_rad = np.radians(lat1)
     lon1_rad = np.radians(lon1)
     lat2_rad = np.radians(lat2)
     lon2_rad = np.radians(lon2)
 
+    # Haversine formula core calculation
     dlon = lon2_rad - lon1_rad
     dlat = lat2_rad - lat1_rad
-    
     a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     
     return R * c
 
-# --- NEW ANALYSIS FUNCTIONS ---
+# --- CORE FEATURE ENGINEERING ---
 
 def calculate_all_features():
     """
-    Calculates Exposure, Maneuver Risk, and Speed Risk and saves the final features.
-    This function replaces the placeholder steps [1], [2], and [3].
+    Performs the full feature engineering pipeline:
+    [1] Calculate Exposure (Distance/Time).
+    [2] Calculate Maneuver Risk (Hard Events).
+    [3] Calculate Speed Risk (Time spent above 90 km/h).
+    Saves the final aggregated features per device.
     """
-    print("\n--- Running Feature Engineering Pipeline (Steps [1], [2], [3]) ---")
+    print("\n--- Running Feature Engineering Pipeline ---")
     
+    # 1. INITIAL DATA PREPARATION
     df = pd.read_csv("Telematicsdata.csv")
     position_df = df[df['variable'] == 'POSITION'].copy()
     parts = position_df['value'].str.split(',', expand=True)
@@ -189,11 +201,13 @@ def calculate_all_features():
     grouped = position_df.groupby('deviceId')
 
     # Calculate Distance, Time Diff, and Speed
+    # Shift() is used to compare the current position/time with the previous position/time for the same device.
     position_df['distance_km'] = grouped.apply(lambda x: haversine_distance(
         x['latitude'].shift(1), x['longitude'].shift(1),
         x['latitude'], x['longitude']
     )).reset_index(level=0, drop=True)
     position_df['time_diff_sec'] = grouped['time_sec'].diff() 
+    # Speed (km/h) = Distance / Time (in hours). Handles division by zero (for stationary records) by setting speed to 0.0.
     position_df['speed_kmh'] = np.where(
         position_df['time_diff_sec'] > 0,
         position_df['distance_km'] / (position_df['time_diff_sec'] / 3600.0),
@@ -202,33 +216,38 @@ def calculate_all_features():
 
     # --- Step [2]: Calculate Maneuver Risk (Hard Events) ---
     print("-> Calculating Hard Braking and Hard Acceleration events...")
+    # Convert speed to meters per second (m/s) for standard acceleration calculation.
     position_df['speed_ms'] = position_df['speed_kmh'] * (1000 / 3600)
     position_df['delta_speed_ms'] = grouped['speed_ms'].diff()
     position_df['delta_time_sec'] = grouped['time_sec'].diff()
+    # Acceleration (m/s^2) = Change in Speed / Change in Time
     position_df['acceleration_ms2'] = np.where(
         position_df['delta_time_sec'] > 0,
         position_df['delta_speed_ms'] / position_df['delta_time_sec'],
         0.0
     )
+    # Flag events based on industry-standard thresholds
     HARD_BRAKE_THRESHOLD = -4.0
     HARD_ACCEL_THRESHOLD = 3.0
     position_df['is_hard_brake'] = position_df['acceleration_ms2'] <= HARD_BRAKE_THRESHOLD
     position_df['is_hard_accel'] = position_df['acceleration_ms2'] >= HARD_ACCEL_THRESHOLD
 
-    # --- Step [1] & [2] Aggregation: Calculate Exposure and Event Counts/Rates ---
-    print("-> Aggregating Exposure and Maneuver Risk by device...")
+    # --- Step [1] & [2] Aggregation: Exposure and Maneuver Risk Aggregation ---
+    print("-> Aggregating Exposure (Distance) and Maneuver Risk (Event Rates) by device...")
     grouped_features = position_df.groupby('deviceId').agg(
         total_distance_km=('distance_km', 'sum'),
         total_hard_brakes=('is_hard_brake', 'sum'),
         total_hard_accels=('is_hard_accel', 'sum'),
         total_driving_time_sec=('time_diff_sec', 'sum')
     ).reset_index()
-    safe_distance = grouped_features['total_distance_km'].replace(0, 1e-6)
+    # Calculate Event Rates (events per 1,000 km driven)
+    safe_distance = grouped_features['total_distance_km'].replace(0, 1e-6) # Avoid division by zero
     grouped_features['hard_brake_rate_per_1000km'] = (grouped_features['total_hard_brakes'] / safe_distance) * 1000
     grouped_features['hard_accel_rate_per_1000km'] = (grouped_features['total_hard_accels'] / safe_distance) * 1000
 
     # --- Step [3]: Calculate Speed Risk (Time spent above 90 km/h) ---
-    print("-> Calculating Speed Risk (time above 90 km/h)...")
+    print("-> Calculating Speed Risk (percentage of time above 90 km/h)...")
+    # Clean data by capping speeds to exclude GPS errors (Outliers)
     CLEAN_SPEED_CAP = 200.0
     clean_moving_df = position_df[
         (position_df['speed_kmh'] > 0) & 
@@ -236,19 +255,23 @@ def calculate_all_features():
     ].copy()
     
     HIGH_SPEED_THRESHOLD = 90.0
+    
+    # 1. Sum time spent above the threshold for each device
     high_speed_time = clean_moving_df[
         clean_moving_df['speed_kmh'] >= HIGH_SPEED_THRESHOLD
     ].groupby('deviceId')['time_diff_sec'].sum().reset_index()
     high_speed_time.columns = ['deviceId', 'time_high_speed_sec']
     
-    # Merge time spent at high speed with total driving time
+    # 2. Calculate total time moving (excluding stationary/errors)
     total_time_moving = clean_moving_df.groupby('deviceId')['time_diff_sec'].sum().reset_index()
     total_time_moving.columns = ['deviceId', 'total_time_moving_sec']
 
+    # 3. Calculate percentage of time spent at high speed
     speed_risk_df = pd.merge(total_time_moving, high_speed_time, on='deviceId', how='left').fillna(0)
     speed_risk_df['percent_time_high_speed'] = (speed_risk_df['time_high_speed_sec'] / speed_risk_df['total_time_moving_sec'].replace(0, 1e-6)) * 100
     
     # --- Final Merge and Save ---
+    # Merge all feature groups into one final DataFrame
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left')
     
     file_name = "Telematics_Risk_Features_FULL.csv"
@@ -263,36 +286,56 @@ def calculate_all_features():
 def calculate_insurance_rate():
     """
     [4] Calculate Insurance Rate - Placeholder for final prediction step.
-    This function would typically load the features generated by calculate_all_features(),
-    load a pre-trained risk model, and predict the final insurance premium or rate for each device.
+    This function demonstrates how the features would be used to generate a risk score or premium.
     """
-    print("\n--- [4] Calculate Insurance Rate ---")
+    print("\n--- [4] Calculate Insurance Rate (Prediction Placeholder) ---")
     
-    # Placeholder: Load the features (assuming they were just generated)
+    # Load the features generated in step [1]
     try:
         final_risk_features = pd.read_csv("Telematics_Risk_Features_FULL.csv")
     except FileNotFoundError:
-        print("Error: Risk features not yet calculated. Please run [1] first.")
+        print("Error: Risk features not yet calculated. Please run [1] Calculate All Features first.")
         return
 
     print(f"Loaded {len(final_risk_features)} device features for prediction.")
     
-    # --- PLACEHOLDER FOR MODEL PREDICTION ---
-    # Example: A simple score based on the highest risk feature (Hard Acceleration Rate)
-    # The higher the rate, the higher the imaginary risk score.
+# Placeholder for loading/simulating a target claims variable (y)
+    # In a real scenario, this comes from a separate claims database
+    final_risk_features['target_claim'] = np.random.randint(0, 2, size=len(final_risk_features))
+
+    # Features to use for the model
+    features = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
+    X = final_risk_features[features]
+    y = final_risk_features['target_claim']
     
-    final_risk_features['risk_score'] = final_risk_features['hard_accel_rate_per_1000km'] * 100
+    # 1. Import and Train a Scikit-learn Model
+    from sklearn.model_selection import train_test_split
+    from sklearn.linear_model import LogisticRegression
+    
+    # Split data (necessary for proper training/testing)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    
+    # Train the model
+    model = LogisticRegression()
+    model.fit(X_train, y_train)
+
+    # 2. Predict Risk Probability
+    # Predicts the probability of the target_claim being 1 (High Risk)
+    risk_probabilities = model.predict_proba(X[features])[:, 1]
+    final_risk_features['risk_score'] = risk_probabilities
+    
+    # 3. Apply a Risk Tier based on the predicted probability
+    HIGH_RISK_PROBABILITY_THRESHOLD = 0.6
     final_risk_features['final_rate'] = np.where(
-        final_risk_features['risk_score'] > 50, 
-        'High Premium', 
+        final_risk_features['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
+        'High Premium (Predicted Risk)', 
         'Standard Premium'
     )
-    # --- END PLACEHOLDER ---
 
-    print("\n--- Example Insurance Risk Prediction ---")
-    prediction_summary = final_risk_features[['deviceId', 'hard_accel_rate_per_1000km', 'risk_score', 'final_rate']].sort_values(by='risk_score', ascending=False)
+    print("\n--- Example Insurance Risk Prediction Summary ---")
+    prediction_summary = final_risk_features[['deviceId', 'hard_accel_rate_per_1000km', 'percent_time_high_speed', 'risk_score', 'final_rate']].sort_values(by='risk_score', ascending=False)
     print(prediction_summary.to_string(index=False))
-    print("\nPrediction complete. This step requires a trained machine learning model in a real application.")
+    print("\nNote: This prediction is based on placeholder logic. A real application requires a trained model.")
 
 
 def main():
@@ -310,13 +353,15 @@ def main():
 
         match choice:
             case "1":
+                # Combines the core feature engineering steps (Exposure, Maneuver, Speed)
                 calculate_all_features()
             case "2":
+                # Uses the calculated features to run a simple prediction
                 calculate_insurance_rate()
-            # case "9":
-            #     # Original test data display function
-            #     df, device_col = retrieve_data("POSITION")
-            #     display_data(df, device_col)
+         #   case "9":
+                # The original function to quickly view the raw filtered data
+          #      df, device_col = retrieve_data("POSITION")
+           #     display_data(df, device_col)
             case "0":
                 print("Exiting the application. Goodbye!")
                 running = False
