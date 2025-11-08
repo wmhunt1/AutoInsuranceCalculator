@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Simple console app to read Telematicsdata.csv and display its contents.
+Simple console app for Telematics Risk Modeling.
 
-Usage:
-  python main.py
-  python main.py --file Telematicsdata.csv --head 50
-  python main.py --device 12345 --columns speed,accel
+This script loads data, calculates risk features (Exposure, Maneuver, Speed), 
+and uses a Logistic Regression model (with placeholder claims data) to predict 
+a risk score and premium tier. It also contains functionality to migrate 
+CSV files to MongoDB, keeping credentials secure via a .env file.
 """
 
 from typing import List, Optional
@@ -13,11 +13,28 @@ import os
 import sys
 import argparse
 import re
-import sklearn
 
+# --- THIRD-PARTY LIBRARIES ---
 import pandas as pd
 import numpy as np
+from pymongo import MongoClient
+from pymongo.server_api import ServerApi
+from dotenv import load_dotenv
+
+# --- SKLEARN FOR MODELING ---
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
+
+# Load environment variables (must happen early)
+load_dotenv()
+
+# --- MongoDB Connection Details ---
+# Reads the URI from the .env file. Falls back to local host if not found.
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+DATABASE_NAME = "telematics_risk_db"
+RAW_DATA_COLLECTION = "raw_telematics"
+CLAIMS_COLLECTION = "claims_history"
 
 # --- CONSTANTS ---
 DEVICE_COL_CANDIDATES = [
@@ -29,8 +46,11 @@ TIME_COL_CANDIDATES = [
 VALUE_COL_CANDIDATES = [
     "value", "values", "Value", "Values"
 ]
+CLAIMS_FILE_NAME = "Claims_History.csv"
+FEATURES_FILE_NAME = "Telematics_Risk_Features_FULL.csv"
 
-# --- UTILITY FUNCTIONS ---
+
+# --- UTILITY FUNCTIONS (Unchanged for brevity) ---
 
 def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     """Tries to find the correct column name (case-insensitive) from a list of candidates."""
@@ -160,7 +180,6 @@ def display_data(df: pd.DataFrame, device_col: str | None) -> None:
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """
     Calculates the great-circle distance (in km) between two latitude/longitude points.
-    This is essential for finding the distance traveled between two GPS fixes.
     """
     # Convert degrees to radians
     lat1_rad = np.radians(lat1)
@@ -181,15 +200,13 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
 def calculate_all_features():
     """
     Performs the full feature engineering pipeline:
-    [1] Calculate Exposure (Distance/Time).
-    [2] Calculate Maneuver Risk (Hard Events).
-    [3] Calculate Speed Risk (Time spent above 90 km/h).
-    Saves the final aggregated features per device.
+    [1] Calculate Exposure (Distance/Time), Maneuver Risk, and Speed Risk.
+    Saves the final aggregated features per device to Telematics_Risk_Features_FULL.csv.
     """
     print("\n--- Running Feature Engineering Pipeline ---")
     
     # 1. INITIAL DATA PREPARATION
-    df = pd.read_csv("Telematicsdata.csv")
+    df = load_csv("Telematicsdata.csv")
     position_df = df[df['variable'] == 'POSITION'].copy()
     parts = position_df['value'].str.split(',', expand=True)
     position_df['latitude'] = pd.to_numeric(parts[0], errors='coerce')
@@ -201,13 +218,11 @@ def calculate_all_features():
     grouped = position_df.groupby('deviceId')
 
     # Calculate Distance, Time Diff, and Speed
-    # Shift() is used to compare the current position/time with the previous position/time for the same device.
     position_df['distance_km'] = grouped.apply(lambda x: haversine_distance(
         x['latitude'].shift(1), x['longitude'].shift(1),
         x['latitude'], x['longitude']
     )).reset_index(level=0, drop=True)
     position_df['time_diff_sec'] = grouped['time_sec'].diff() 
-    # Speed (km/h) = Distance / Time (in hours). Handles division by zero (for stationary records) by setting speed to 0.0.
     position_df['speed_kmh'] = np.where(
         position_df['time_diff_sec'] > 0,
         position_df['distance_km'] / (position_df['time_diff_sec'] / 3600.0),
@@ -216,17 +231,14 @@ def calculate_all_features():
 
     # --- Step [2]: Calculate Maneuver Risk (Hard Events) ---
     print("-> Calculating Hard Braking and Hard Acceleration events...")
-    # Convert speed to meters per second (m/s) for standard acceleration calculation.
     position_df['speed_ms'] = position_df['speed_kmh'] * (1000 / 3600)
     position_df['delta_speed_ms'] = grouped['speed_ms'].diff()
     position_df['delta_time_sec'] = grouped['time_sec'].diff()
-    # Acceleration (m/s^2) = Change in Speed / Change in Time
     position_df['acceleration_ms2'] = np.where(
         position_df['delta_time_sec'] > 0,
         position_df['delta_speed_ms'] / position_df['delta_time_sec'],
         0.0
     )
-    # Flag events based on industry-standard thresholds
     HARD_BRAKE_THRESHOLD = -4.0
     HARD_ACCEL_THRESHOLD = 3.0
     position_df['is_hard_brake'] = position_df['acceleration_ms2'] <= HARD_BRAKE_THRESHOLD
@@ -240,14 +252,12 @@ def calculate_all_features():
         total_hard_accels=('is_hard_accel', 'sum'),
         total_driving_time_sec=('time_diff_sec', 'sum')
     ).reset_index()
-    # Calculate Event Rates (events per 1,000 km driven)
-    safe_distance = grouped_features['total_distance_km'].replace(0, 1e-6) # Avoid division by zero
+    safe_distance = grouped_features['total_distance_km'].replace(0, 1e-6)
     grouped_features['hard_brake_rate_per_1000km'] = (grouped_features['total_hard_brakes'] / safe_distance) * 1000
     grouped_features['hard_accel_rate_per_1000km'] = (grouped_features['total_hard_accels'] / safe_distance) * 1000
 
     # --- Step [3]: Calculate Speed Risk (Time spent above 90 km/h) ---
     print("-> Calculating Speed Risk (percentage of time above 90 km/h)...")
-    # Clean data by capping speeds to exclude GPS errors (Outliers)
     CLEAN_SPEED_CAP = 200.0
     clean_moving_df = position_df[
         (position_df['speed_kmh'] > 0) & 
@@ -256,89 +266,166 @@ def calculate_all_features():
     
     HIGH_SPEED_THRESHOLD = 90.0
     
-    # 1. Sum time spent above the threshold for each device
     high_speed_time = clean_moving_df[
         clean_moving_df['speed_kmh'] >= HIGH_SPEED_THRESHOLD
     ].groupby('deviceId')['time_diff_sec'].sum().reset_index()
     high_speed_time.columns = ['deviceId', 'time_high_speed_sec']
     
-    # 2. Calculate total time moving (excluding stationary/errors)
     total_time_moving = clean_moving_df.groupby('deviceId')['time_diff_sec'].sum().reset_index()
     total_time_moving.columns = ['deviceId', 'total_time_moving_sec']
 
-    # 3. Calculate percentage of time spent at high speed
     speed_risk_df = pd.merge(total_time_moving, high_speed_time, on='deviceId', how='left').fillna(0)
     speed_risk_df['percent_time_high_speed'] = (speed_risk_df['time_high_speed_sec'] / speed_risk_df['total_time_moving_sec'].replace(0, 1e-6)) * 100
     
     # --- Final Merge and Save ---
-    # Merge all feature groups into one final DataFrame
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left')
     
-    file_name = "Telematics_Risk_Features_FULL.csv"
-    final_risk_features.to_csv(file_name, index=False)
+    final_risk_features.to_csv(FEATURES_FILE_NAME, index=False)
     
     print(f"\nSuccessfully generated {len(final_risk_features)} device features.")
-    print(f"Final feature table saved to: {file_name}")
+    print(f"Final feature table saved to: {FEATURES_FILE_NAME}")
     print("\n--- Summary of Final Features (First 3 Devices) ---")
     print(final_risk_features.head(3).to_string(index=False))
 
 
 def calculate_insurance_rate():
     """
-    [4] Calculate Insurance Rate - Placeholder for final prediction step.
-    This function demonstrates how the features would be used to generate a risk score or premium.
+    [4] Calculate Insurance Rate - Implements Logistic Regression using features 
+    and the Claims_History.csv target variable.
     """
-    print("\n--- [4] Calculate Insurance Rate (Prediction Placeholder) ---")
+    print("\n--- [4] Calculate Insurance Rate (Predicting Risk Score) ---")
     
-    # Load the features generated in step [1]
-    try:
-        final_risk_features = pd.read_csv("Telematics_Risk_Features_FULL.csv")
-    except FileNotFoundError:
-        print("Error: Risk features not yet calculated. Please run [1] Calculate All Features first.")
+    # Check if features file exists (must run [1] first)
+    if not os.path.exists(FEATURES_FILE_NAME):
+        print(f"Error: Risk features file '{FEATURES_FILE_NAME}' not found. Please run [1] Calculate All Features first.")
+        return
+        
+    # Check if claims file exists (must be generated/provided)
+    if not os.path.exists(CLAIMS_FILE_NAME):
+        print(f"Error: Claims history file '{CLAIMS_FILE_NAME}' not found. Please generate it first.")
         return
 
-    print(f"Loaded {len(final_risk_features)} device features for prediction.")
-    
-# Placeholder for loading/simulating a target claims variable (y)
-    # In a real scenario, this comes from a separate claims database
-    final_risk_features['target_claim'] = np.random.randint(0, 2, size=len(final_risk_features))
+    # 1. LOAD DATA
+    final_risk_features = pd.read_csv(FEATURES_FILE_NAME)
+    claims_data = pd.read_csv(CLAIMS_FILE_NAME)
 
-    # Features to use for the model
+    # 2. MERGE: Combine Features (X) with Target (Y)
+    print("-> Merging features with claims data to get the target variable (Y)...")
+    model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
+    # Fill NaN claims with 0 (assuming devices with no match had no claim in the period)
+    model_data['has_claim'] = model_data['has_claim'].fillna(0).astype(int)
+
+    # --- MODEL PREPARATION ---
+    # Define Features (X) and Target (Y)
     features = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
-    X = final_risk_features[features]
-    y = final_risk_features['target_claim']
     
-    # 1. Import and Train a Scikit-learn Model
-    from sklearn.model_selection import train_test_split
-    from sklearn.linear_model import LogisticRegression
-    
-    # Split data (necessary for proper training/testing)
+    # Check for features availability
+    missing_features = [f for f in features if f not in model_data.columns]
+    if missing_features:
+        print(f"Error: Missing features in model data: {missing_features}. Cannot run prediction.")
+        return
+
+    X = model_data[features]
+    y = model_data['has_claim']
+
+    # Handle cases where all target values are the same (prevents model crash)
+    if y.nunique() <= 1:
+        print("Warning: Target variable 'has_claim' is constant. Cannot train model. Skipping prediction.")
+        return
+
+    # Split the data into training (70%) and testing (30%) sets
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
     
-    # Train the model
-    model = LogisticRegression()
+    # --- MODEL TRAINING AND PREDICTION ---
+    print(f"-> Training Logistic Regression Model on {len(X_train)} training records...")
+    
+    # 1. Train the Logistic Regression model
+    model = LogisticRegression(random_state=42, solver='liblinear') # using liblinear for stability on small datasets
     model.fit(X_train, y_train)
 
-    # 2. Predict Risk Probability
-    # Predicts the probability of the target_claim being 1 (High Risk)
-    risk_probabilities = model.predict_proba(X[features])[:, 1]
-    final_risk_features['risk_score'] = risk_probabilities
+    # 2. Predict Risk Probability (Score) for ALL data points
+    # [:, 1] extracts the probability of the positive class (i.e., probability of a claim = 1)
+    risk_probabilities = model.predict_proba(X)[:, 1]
+    model_data['risk_score'] = risk_probabilities
     
     # 3. Apply a Risk Tier based on the predicted probability
-    HIGH_RISK_PROBABILITY_THRESHOLD = 0.6
-    final_risk_features['final_rate'] = np.where(
-        final_risk_features['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
+    HIGH_RISK_PROBABILITY_THRESHOLD = 0.55 # Example cutoff
+    model_data['final_rate'] = np.where(
+        model_data['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
         'High Premium (Predicted Risk)', 
         'Standard Premium'
     )
+    
+    print("\n-> Prediction Summary (Highest Risk Devices) ---")
+    prediction_summary = model_data[[
+        'deviceId', 'has_claim', 'hard_brake_rate_per_1000km', 
+        'percent_time_high_speed', 'risk_score', 'final_rate'
+    ]].sort_values(by='risk_score', ascending=False)
+    
+    print(prediction_summary.head(10).to_string(index=False))
+    print("\nPrediction complete. The 'risk_score' is the predicted probability of a claim.")
 
-    print("\n--- Example Insurance Risk Prediction Summary ---")
-    prediction_summary = final_risk_features[['deviceId', 'hard_accel_rate_per_1000km', 'percent_time_high_speed', 'risk_score', 'final_rate']].sort_values(by='risk_score', ascending=False)
-    print(prediction_summary.to_string(index=False))
-    print("\nNote: This prediction is based on placeholder logic. A real application requires a trained model.")
+# --- MONGODB MIGRATION LOGIC ---
 
+def migrate_csv_to_mongodb(csv_file_path: str, collection_name: str, client: MongoClient):
+    """
+    Loads a CSV file and inserts its records into the specified MongoDB collection.
+    """
+    print(f"\nAttempting to load data from: {csv_file_path}")
+    
+    # 1. Load CSV data into a Pandas DataFrame
+    try:
+        df = pd.read_csv(csv_file_path)
+    except FileNotFoundError:
+        print(f"Error: File not found at {csv_file_path}. Skipping migration for this file.")
+        return
+
+    # 2. Convert the DataFrame to a list of Python dictionaries (JSON-like documents)
+    data_records = df.to_dict('records')
+    
+    # 3. Get the database and collection
+    db = client[DATABASE_NAME]
+    collection = db[collection_name]
+    
+    # 4. Insert the data
+    try:
+        if data_records:
+            # Clear collection before inserting to ensure a clean run
+            # WARNING: Uncommenting this will delete ALL existing data in the collection
+            # collection.delete_many({}) 
+            result = collection.insert_many(data_records)
+            print(f"✅ Successfully inserted {len(result.inserted_ids)} records into '{collection_name}'.")
+        else:
+            print(f"Warning: CSV file {csv_file_path} was empty.")
+    except Exception as e:
+        print(f"❌ An error occurred during MongoDB insert for {collection_name}: {e}")
+
+def run_migration():
+    """Establishes MongoDB connection and runs the migration for all CSV files."""
+    try:
+        # Use a 'with' statement to ensure the connection is closed automatically
+        print(f"\n--- Attempting connection to MongoDB at: {MONGO_URI} ---")
+        with MongoClient(MONGO_URI) as client:
+            # The server_api is often required for modern Atlas clusters
+            # client = MongoClient(MONGO_URI, server_api=ServerApi('1')) 
+            
+            client.admin.command('ping')
+            print("✨ Successfully connected to MongoDB.")
+            
+            # 1. Migrate the large raw data file
+            migrate_csv_to_mongodb("Telematicsdata.csv", RAW_DATA_COLLECTION, client)
+            
+            # 2. Migrate the smaller claims history file
+            migrate_csv_to_mongodb(CLAIMS_FILE_NAME, CLAIMS_COLLECTION, client)
+            
+    except Exception as e:
+        print(f"🚨 FAILED to connect to MongoDB. Please check your MONGO_URI, network access, and firewall settings. Error: {e}")
+
+
+# --- MAIN CLI EXECUTION ---
 
 def main():
+    """The main command line interface loop."""
     running = True
     while running:
         
@@ -346,22 +433,22 @@ def main():
         print(" Welcome to the Telematics Risk Model CLI")
         print("=======================================")
         print("[1] Calculate All Features (Exposure, Maneuver, Speed)")
-        print("[2] Calculate Insurance Rate (Prediction Placeholder)")
-        #print("[9] Display Test Data (Raw POSITION rows)")
+        print("[2] Calculate Insurance Rate (Run Logistic Regression Model)")
+        print("[3] MIGRATE CSV DATA TO MONGODB (One-time setup)")
+        print("[9] Display Test Data (Raw POSITION rows)")
         print("[0] Quit")
         choice = input("Selection: ").strip().lower()
 
         match choice:
             case "1":
-                # Combines the core feature engineering steps (Exposure, Maneuver, Speed)
                 calculate_all_features()
             case "2":
-                # Uses the calculated features to run a simple prediction
                 calculate_insurance_rate()
-         #   case "9":
-                # The original function to quickly view the raw filtered data
-          #      df, device_col = retrieve_data("POSITION")
-           #     display_data(df, device_col)
+            case "3":
+                run_migration()
+            case "9":
+                df, device_col = retrieve_data("POSITION")
+                display_data(df, device_col)
             case "0":
                 print("Exiting the application. Goodbye!")
                 running = False

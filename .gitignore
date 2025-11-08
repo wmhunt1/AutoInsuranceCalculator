@@ -361,3 +361,16 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# .gitignore file content
+
+# Python environment files
+.env
+
+# Dependencies and build files
+__pycache__/
+venv/
+*.pyc
+
+# Data files that should not be committed (like your generated features)
+Telematics_Risk_Features_FULL.csv
