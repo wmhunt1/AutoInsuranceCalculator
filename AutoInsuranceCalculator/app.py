@@ -9,6 +9,7 @@ All necessary imports and utility functions from the original script are include
 
 # --- FLASK IMPORTS ---
 from flask import Flask, request, jsonify
+from flask_cors import CORS # Import the CORS module
 
 # --- CORE LIBRARIES IMPORTS ---
 from typing import List, Optional, Any
@@ -39,6 +40,12 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- CONFIGURATION (UNCHANGED) ---
+CORS_ORIGIN = ["https://github.com/wmhunt1.io"] 
+
+# If you want to allow multiple specific domains (for safety):
+
+CORS(app, resources={r"/*": {"origins": CORS_ORIGIN}})
+
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
 RAW_DATA_COLLECTION = "raw_telematics"
