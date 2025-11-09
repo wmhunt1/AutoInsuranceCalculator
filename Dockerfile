@@ -29,5 +29,5 @@ COPY . .
 EXPOSE 5000
 
 # Define the production command using Gunicorn
-# Adjust 'app:app' if your Flask app instance is named differently or in a different file
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
+# FIX: Using 'python -m gunicorn' ensures the executable is found reliably within the Python environment.
+CMD ["python", "-m", "gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
