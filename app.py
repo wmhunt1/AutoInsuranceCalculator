@@ -42,7 +42,11 @@ app = Flask(__name__)
 # --- CRITICAL STEP: CONFIGURE CORS ---
 # You must update this with your actual GitHub Pages URL later for security.
 # For now, we allow all origins ('*') for easy testing, but restrict methods.
-CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
+CORS(app, resources={r"/*": {"origins": [
+    "http://localhost:3000",
+    "https://your-frontend-domain.com",
+    "http://localhost:50949/"
+]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
 # NOTE: The default here is for local testing. In Railway, this MUST be overridden
