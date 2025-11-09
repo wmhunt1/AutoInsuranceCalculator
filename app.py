@@ -43,9 +43,8 @@ app = Flask(__name__)
 # You must update this with your actual GitHub Pages URL later for security.
 # For now, we allow all origins ('*') for easy testing, but restrict methods.
 CORS(app, resources={r"/*": {"origins": [
-    "http://localhost:3000",
+    "http://localhost"
     "https://your-frontend-domain.com",
-    "http://localhost:50949"
 ]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
