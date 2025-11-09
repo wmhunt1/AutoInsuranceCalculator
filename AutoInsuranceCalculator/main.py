@@ -13,6 +13,9 @@ import argparse
 import re
 import time
 import hashlib 
+import random 
+import string 
+import getpass # <-- ADDED: For secure password input
 
 # --- THIRD-PARTY LIBRARIES ---
 import pandas as pd
@@ -67,7 +70,165 @@ def verify_password(stored_hash: str, provided_password: str, salt: str = "secur
     """
     return stored_hash == hash_password(provided_password, salt)
 
-# --- UTILITY FUNCTIONS ---
+# --- USER CREATION/MANAGEMENT ---
+
+def generate_random_device_id(length=32):
+    """Generates a random alphanumeric string to simulate a new device ID."""
+    characters = string.ascii_letters + string.digits
+    return ''.join(random.choice(characters) for i in range(length))
+
+def create_new_user():
+    """
+    Prompts for new user details, generates a device ID, clones 
+    the data from a random existing device, and assigns random claims history.
+    """
+    print("\n--- 📝 New User Registration ---")
+    
+    # Get user input
+    new_username = input("Enter new Username: ").strip().lower()
+    new_name = input("Enter full Name: ").strip()
+    # Using getpass for the new user's password input
+    new_password = getpass.getpass("Enter Password: ").strip() 
+
+    # 1. Generate new device ID
+    new_device_id = generate_random_device_id()
+    
+    # 2. Select a random existing device ID to clone data from
+    try:
+        df_raw = load_csv("Telematicsdata.csv")
+        device_col = pick_device_column(df_raw)
+        if not device_col:
+            raise ValueError("Could not find device ID column in raw data.")
+            
+        unique_device_ids = df_raw[device_col].astype(str).unique()
+        if len(unique_device_ids) == 0:
+            raise ValueError("No unique device IDs found in raw data to clone.")
+            
+        source_device_id = random.choice(unique_device_ids)
+        
+    except Exception as e:
+        print(f"❌ Error during data preparation for new user: {e}")
+        return
+
+    # 3. Generate random claim status (0 or 1)
+    random_has_claim = random.choice([0, 1])
+    
+    # 4. Hash password and prepare user data
+    hashed_pw = hash_password(new_password)
+    new_user_data = {
+        "user_id": f"user_new_{time.time()}",
+        "username": new_username,
+        "name": new_name,
+        "device_id": new_device_id,
+        "hashed_password": hashed_pw,
+        "source_device_id": source_device_id, # The device whose driving data this user will use
+        "has_claim": random_has_claim        # The simulated claims history for this user
+    }
+    
+    # 5. Save to MongoDB
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # Check for existing username
+            if collection.find_one({"username": new_username}):
+                print(f"❌ Registration failed: Username '{new_username}' already exists.")
+                return
+
+            result = collection.insert_one(new_user_data)
+            
+            print(f"\n✅ User '{new_name}' created successfully.")
+            print(f"   - Assigned New Device ID: {new_device_id}")
+            print(f"   - **Fetching driving record...** (using data from {source_device_id})")
+            print(f"   - **Generating claims history:** {'YES (1)' if random_has_claim == 1 else 'NO (0)'}")
+            print("---------------------------------------")
+            print(f"You can now log in as: '{new_username}'")
+            
+    except Exception as e:
+        print(f"❌ Failed to create user. Error: {e}")
+
+
+def get_mongo_client():
+    """Returns a connected MongoClient using the URI."""
+    return MongoClient(MONGO_URI)
+
+def load_sample_users():
+    """Defines and loads sample user data into the MongoDB users collection, including hashed passwords and claim status."""
+    print("\n--- Loading Sample User Data ---")
+    
+    # Load claims data to find out the claims status of the sample users' devices
+    claims_map = {}
+    try:
+        claims_df = load_csv(CLAIMS_FILE_NAME)[['deviceId', 'has_claim']]
+        claims_map = claims_df.set_index('deviceId')['has_claim'].to_dict()
+    except Exception:
+        print("Warning: Claims file not available. Cannot set initial claim status for sample users.")
+
+    # Store plain passwords in a dict for hashing before saving
+    user_passwords = {
+        "alice_smith": "Password123",
+        "bob_johnson": "SecurePass456",
+        "charlie_brown": "TestUser789",
+    }
+    
+    # NOTE: These device_ids are derived from your Telematicsdata.csv
+    sample_users_data = [
+        {"user_id": "user_one_id", "username": "alice_smith", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
+        {"user_id": "user_two_id", "username": "bob_johnson", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
+        {"user_id": "user_three_id", "username": "charlie_brown", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
+    ]
+
+    # HASH THE PASSWORDS and add them to the data, along with their actual claim status
+    for user in sample_users_data:
+        plain_pw = user_passwords[user['username']]
+        user['hashed_password'] = hash_password(plain_pw)
+        user['source_device_id'] = user['device_id'] # Old users use their own device ID as source
+        user['has_claim'] = claims_map.get(user['device_id'], 0) # Fetch claim status, default to 0
+        
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # Clear existing data and insert new data
+            collection.delete_many({})
+            result = collection.insert_many(sample_users_data)
+            
+            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}' with hashed passwords.")
+            print("--- Sample Users Loaded (Credentials for testing) ---")
+            for user in sample_users_data:
+                print(f"  - User: {user['username']} | Pass: {user_passwords[user['username']]} | Claim: {user['has_claim']}")
+                
+    except Exception as e:
+        print(f"❌ Failed to load sample users. Error: {e}")
+
+def get_user_by_credentials(username: str, password: str):
+    """Fetches a user document from MongoDB and verifies the password."""
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # 1. Find user by username
+            user_data = collection.find_one({"username": username})
+            
+            if user_data:
+                # 2. Verify password against stored hash
+                if verify_password(user_data['hashed_password'], password):
+                    return user_data
+                else:
+                    print("Login failed: Invalid password.")
+                    return None
+            else:
+                print(f"Login failed: User '{username}' not found.")
+                return None
+                
+    except Exception as e:
+        print(f"❌ Error fetching user data from MongoDB: {e}")
+        return None
+
+# --- UTILITY FUNCTIONS (UNCHANGED) ---
 
 def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     """Tries to find the correct column name (case-insensitive) from a list of candidates."""
@@ -213,77 +374,6 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     return R * c
 
 
-# --- MONGODB CONNECTION AND USER MANAGEMENT (UNCHANGED) ---
-
-def get_mongo_client():
-    """Returns a connected MongoClient using the URI."""
-    return MongoClient(MONGO_URI)
-
-def load_sample_users():
-    """Defines and loads sample user data into the MongoDB users collection, including hashed passwords."""
-    print("\n--- Loading Sample User Data ---")
-    
-    # Store plain passwords in a dict for hashing before saving
-    user_passwords = {
-        "alice_smith": "Password123",
-        "bob_johnson": "SecurePass456",
-        "charlie_brown": "TestUser789",
-    }
-    
-    # NOTE: These device_ids are derived from your Telematicsdata.csv
-    sample_users_data = [
-        {"user_id": "user_one_id", "username": "alice_smith", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
-        {"user_id": "user_two_id", "username": "bob_johnson", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
-        {"user_id": "user_three_id", "username": "charlie_brown", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
-    ]
-
-    # HASH THE PASSWORDS and add them to the data
-    for user in sample_users_data:
-        plain_pw = user_passwords[user['username']]
-        user['hashed_password'] = hash_password(plain_pw)
-        
-    try:
-        with get_mongo_client() as client:
-            db = client[DATABASE_NAME]
-            collection = db[USERS_COLLECTION]
-            
-            # Clear existing data and insert new data
-            collection.delete_many({})
-            result = collection.insert_many(sample_users_data)
-            
-            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}' with hashed passwords.")
-            print("--- Sample Users Loaded (Credentials for testing) ---")
-            for user in sample_users_data:
-                print(f"  - User: {user['username']} | Pass: {user_passwords[user['username']]} | Device: {user['device_id']}")
-                
-    except Exception as e:
-        print(f"❌ Failed to load sample users. Error: {e}")
-
-def get_user_by_credentials(username: str, password: str):
-    """Fetches a user document from MongoDB and verifies the password."""
-    try:
-        with get_mongo_client() as client:
-            db = client[DATABASE_NAME]
-            collection = db[USERS_COLLECTION]
-            
-            # 1. Find user by username
-            user_data = collection.find_one({"username": username})
-            
-            if user_data:
-                # 2. Verify password against stored hash
-                if verify_password(user_data['hashed_password'], password):
-                    return user_data
-                else:
-                    print("Login failed: Invalid password.")
-                    return None
-            else:
-                print(f"Login failed: User '{username}' not found.")
-                return None
-                
-    except Exception as e:
-        print(f"❌ Error fetching user data from MongoDB: {e}")
-        return None
-
 # --- MONGODB MIGRATION LOGIC (UNCHANGED) ---
 
 def migrate_csv_to_mongodb(csv_file_path: str, collection_name: str, client: MongoClient):
@@ -320,29 +410,34 @@ def run_migration():
 
 # --- CORE FEATURE ENGINEERING (UNCHANGED) ---
 
-def calculate_all_features(device_id: Optional[str]):
+def calculate_all_features(device_id: Optional[str], source_device_id: Optional[str] = None):
     """
-    Performs the full feature engineering pipeline, either for a single device 
-    or for ALL devices if device_id is None.
+    Performs the full feature engineering pipeline.
+    If source_device_id is provided, it uses the data for that device ID
+    but assigns the features to the main device_id (for new users).
     """
-    mode = device_id if device_id else 'ALL'
-    print(f"\n--- Running Feature Engineering Pipeline for Device: {mode} ---")
+    
+    # Determine which ID to use for filtering (source_device_id if provided, otherwise device_id)
+    filter_id = source_device_id if source_device_id else device_id
+    mode = filter_id if filter_id else 'ALL'
+    
+    print(f"\n--- Running Feature Engineering Pipeline using Data from Device: {mode} ---")
     
     # 1. INITIAL DATA PREPARATION
     df = load_csv("Telematicsdata.csv")
     
-    # Filter by device ID immediately if specified
-    if device_id:
-        df = df[df['deviceId'].astype(str) == str(device_id)].copy()
+    # Filter by the actual data source ID
+    if filter_id:
+        df = df[df['deviceId'].astype(str) == str(filter_id)].copy()
         if df.empty:
-            print(f"Error: No data found for device ID: {device_id}")
+            print(f"Error: No data found for device ID: {filter_id}")
             return
             
     position_df = df[df['variable'] == 'POSITION'].copy()
     
-    # Check if any POSITION data exists for the filtered device(s)
     if position_df.empty:
         print(f"Warning: No 'POSITION' data found for device {mode}. Cannot calculate movement features.")
+        # Simplified empty feature generation for new users
         if device_id:
             final_risk_features = pd.DataFrame({
                 'deviceId': [device_id], 
@@ -351,20 +446,16 @@ def calculate_all_features(device_id: Optional[str]):
                 'hard_accel_rate_per_1000km': [0.0],
                 'percent_time_high_speed': [0.0]
             })
-            print(f"\n✅ Features for Device {device_id} Calculated:")
-            print(final_risk_features.head(1).to_string(index=False))
+            return final_risk_features
         return
     
-    # Handle the 'value' column extraction
+    # Handle the 'value' column extraction (coordinate parsing)
     parts = position_df['value'].str.split(',', expand=True)
-    
-    # Use .loc to ensure the columns are created and assigned correctly.
     position_df.loc[:, 'latitude'] = pd.to_numeric(parts.iloc[:, 0], errors='coerce')
     position_df.loc[:, 'longitude'] = pd.to_numeric(parts.iloc[:, 1], errors='coerce')
 
     position_df.dropna(subset=['latitude', 'longitude'], inplace=True)
     
-    # Re-check for empty data after dropping NaNs
     if position_df.empty:
         print(f"Warning: No valid coordinate data found after cleaning for device {mode}. Cannot calculate movement features.")
         if device_id:
@@ -375,17 +466,17 @@ def calculate_all_features(device_id: Optional[str]):
                 'hard_accel_rate_per_1000km': [0.0],
                 'percent_time_high_speed': [0.0]
             })
-            print(f"\n✅ Features for Device {device_id} Calculated:")
-            print(final_risk_features.head(1).to_string(index=False))
+            return final_risk_features
         return
 
     # Prepare time columns
     position_df['datetime'] = pd.to_datetime(position_df['timestamp'])
     position_df['time_sec'] = position_df['datetime'].astype(np.int64) // 10**9
     
+    # Crucially, we group by the original deviceId in the data being processed
     grouped = position_df.groupby('deviceId')
 
-    # Create Lagged Columns first, then calculate distance vectorially
+    # ... (Rest of feature calculation logic) ...
     print("-> Calculating distance using grouped lagged coordinates...")
     position_df.loc[:, 'latitude_prev'] = grouped['latitude'].shift(1)
     position_df.loc[:, 'longitude_prev'] = grouped['longitude'].shift(1)
@@ -402,7 +493,6 @@ def calculate_all_features(device_id: Optional[str]):
         0.0 
     )
 
-    # --- Step [2]: Calculate Maneuver Risk (Hard Events) ---
     print("-> Calculating Hard Braking and Hard Acceleration events...")
     position_df['speed_ms'] = position_df['speed_kmh'] * (1000 / 3600)
     position_df['delta_speed_ms'] = grouped['speed_ms'].diff()
@@ -417,7 +507,6 @@ def calculate_all_features(device_id: Optional[str]):
     position_df['is_hard_brake'] = position_df['acceleration_ms2'] <= HARD_BRAKE_THRESHOLD
     position_df['is_hard_accel'] = position_df['acceleration_ms2'] >= HARD_ACCEL_THRESHOLD
 
-    # --- Step [1] & [2] Aggregation: Exposure and Maneuver Risk Aggregation ---
     print("-> Aggregating Exposure (Distance) and Maneuver Risk (Event Rates) by device...")
     grouped_features = position_df.groupby('deviceId').agg(
         total_distance_km=('distance_km', 'sum'),
@@ -429,7 +518,6 @@ def calculate_all_features(device_id: Optional[str]):
     grouped_features['hard_brake_rate_per_1000km'] = (grouped_features['total_hard_brakes'] / safe_distance) * 1000
     grouped_features['hard_accel_rate_per_1000km'] = (grouped_features['total_hard_accels'] / safe_distance) * 1000
 
-    # --- Step [3]: Calculate Speed Risk (Time spent above 90 km/h) ---
     print("-> Calculating Speed Risk (percentage of time above 90 km/h)...")
     CLEAN_SPEED_CAP = 200.0
     clean_moving_df = position_df[
@@ -450,21 +538,24 @@ def calculate_all_features(device_id: Optional[str]):
     speed_risk_df = pd.merge(total_time_moving, high_speed_time, on='deviceId', how='left').fillna(0)
     speed_risk_df['percent_time_high_speed'] = (speed_risk_df['time_high_speed_sec'] / speed_risk_df['total_time_moving_sec'].replace(0, 1e-6)) * 100
     
-    # --- Final Merge and Save/Display ---
+    # --- Final Merge and Output Assignment ---
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left')
-    
-    if device_id:
-        print(f"\n✅ Features for Device {device_id} Calculated.")
-        pass
+
+    if filter_id and device_id and (filter_id != device_id):
+        # If running for a new user (using source data), replace the deviceId in the output
+        final_risk_features.loc[:, 'deviceId'] = device_id
+        print(f"\n✅ Features Calculated and assigned to New Device ID: {device_id}")
+    elif filter_id:
+        print(f"\n✅ Features for Device {filter_id} Calculated.")
     else:
-        # Only save the full file if we processed ALL devices (Batch Mode)
+        # Batch Mode - runs on all data
         final_risk_features.to_csv(FEATURES_FILE_NAME, index=False)
         print(f"\nSuccessfully generated {len(final_risk_features)} device features.")
         print(f"Final feature table saved to: {FEATURES_FILE_NAME}")
 
     return final_risk_features
 
-# --- SIMULATION FUNCTION (External API) ---
+# --- SIMULATION FUNCTION (External API - UNCHANGED) ---
 
 def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     """
@@ -511,15 +602,17 @@ def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
 
     return premium, quote_message
 
-# --- CORE PREMIUM ESTIMATION (UPDATED FOR BOTH INTERNAL/EXTERNAL) ---
+# --- CORE PREMIUM ESTIMATION (UNCHANGED) ---
 
-def get_and_display_all_estimates(device_id: str):
+def get_and_display_all_estimates(user_data):
     """
     Calculates the internal risk score/premium and calls the simulated external API.
     """
-    
-    print(f"\n--- [2] Generating Internal and External Premium Estimates for Device: {device_id} ---")
+    device_id = user_data['device_id']
+    source_device_id = user_data.get('source_device_id', device_id) # Use the source ID if it exists
 
+    print(f"\n--- [2] Generating Internal and External Premium Estimates for Device: {device_id} ---")
+    
     # 1. Check dependencies
     if not os.path.exists(FEATURES_FILE_NAME) or not os.path.exists(CLAIMS_FILE_NAME):
         print(f"Error: Required feature or claims files not found.")
@@ -530,14 +623,22 @@ def get_and_display_all_estimates(device_id: str):
     final_risk_features = pd.read_csv(FEATURES_FILE_NAME)
     claims_data = pd.read_csv(CLAIMS_FILE_NAME)
 
-    target_features_df = final_risk_features[final_risk_features['deviceId'].astype(str) == str(device_id)].copy()
+    # Note: Target features must be filtered by the logged-in user's source device_id (if a new user)
+    target_features_df = final_risk_features[final_risk_features['deviceId'].astype(str) == str(source_device_id)].copy()
     
     if target_features_df.empty:
-        print(f"Error: No features found in {FEATURES_FILE_NAME} for device ID: {device_id}. Cannot provide an estimate.")
-        return
+        # If the batch file doesn't contain the data, calculate it in real-time
+        print(f"Warning: Batch feature data missing for source ID {source_device_id}. Calculating real-time features...")
+        target_features_df = calculate_all_features(device_id=device_id, source_device_id=source_device_id)
+        if target_features_df is None or target_features_df.empty:
+            print("Fatal Error: Could not generate real-time features. Cannot provide an estimate.")
+            return
 
     target_features = target_features_df.iloc[0]
     
+    # Temporarily correct the deviceId for display if it's a new user
+    target_features.loc['deviceId'] = device_id 
+
     features_cols = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
     full_model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
     full_y = full_model_data['has_claim'].fillna(0).astype(int)
@@ -554,23 +655,27 @@ def get_and_display_all_estimates(device_id: str):
         model = LogisticRegression(random_state=42, solver='liblinear')
         model.fit(X_train, y_train)
 
-        # Predict Risk Probability (Score)
-        X_predict = target_features_df[features_cols]
+        # Predict Risk Probability (Score) - use the data row from the source ID
+        X_predict = target_features_df[features_cols] 
         internal_risk_score = model.predict_proba(X_predict)[:, 1][0]
         
         # 4. Calculate Internal Premium
         BASE_PREMIUM = 1000.0
-        RISK_MULTIPLIER = 1.0 # Max 100% premium uplift at a score of 1.0
+        RISK_MULTIPLIER = 1.0 
         internal_premium = BASE_PREMIUM * (1 + internal_risk_score * RISK_MULTIPLIER)
 
     # 5. CALL THE SIMULATED EXTERNAL API 
     external_premium, external_message = get_simulated_premium(target_features)
     
     # 6. Display Results
+    user_has_claim = user_data.get('has_claim', 'N/A')
+    
     print("\n=============================================")
     print("      *** FINAL PREMIUM ESTIMATES ***")
     print("=============================================")
+    print(f"Driver Name: {user_data['name']}")
     print(f"Device ID: {device_id}")
+    print(f"Actual Claim History: {'YES (1)' if user_has_claim == 1 else 'NO (0)'} 🧐")
     print(f"Driving Exposure (Distance): {target_features['total_distance_km']:.0f} km")
     print("---------------------------------------------")
 
@@ -587,7 +692,7 @@ def get_and_display_all_estimates(device_id: str):
     print("=============================================")
 
 
-# --- CLI EXECUTION LOOPS (UPDATED MENU TEXT) ---
+# --- CLI EXECUTION LOOPS (UPDATED) ---
 
 def session_main(user_data):
     """The main CLI loop run after a user has logged in."""
@@ -612,9 +717,9 @@ def session_main(user_data):
 
         match choice:
             case "1":
-                calculate_all_features(device_id)
+                calculate_all_features(device_id, user_data.get('source_device_id', device_id))
             case "2":
-                get_and_display_all_estimates(device_id)
+                get_and_display_all_estimates(user_data)
             case "4":
                 # Original batch mode (no device ID) - runs on all data
                 calculate_all_features(device_id=None)
@@ -637,6 +742,7 @@ def login_main():
         print("=======================================")
         print("Select Action:")
         print("[L] Login to Account")
+        print("[C] Create New User 🧑‍🔬")
         print("---------------------------------------")
         print("[8] Run MongoDB CSV Migration 🚀 (One-Time)")
         print("[9] Load Sample Users 🧑‍💻 (One-Time)")
@@ -647,12 +753,14 @@ def login_main():
         match choice:
             case "l":
                 username = input("Enter Username: ").strip().lower()
-                # Security Best Practice: Use getpass.getpass() in a real app
-                password = input("Enter Password: ").strip() 
+                # Use getpass.getpass() to securely read the password
+                password = getpass.getpass("Enter Password: ").strip() 
                 user_data = get_user_by_credentials(username, password)
                 if user_data:
                     # Pass control to the session menu
                     session_main(user_data)
+            case "c":
+                create_new_user()
             case "8":
                 run_migration()
             case "9":
