@@ -5,13 +5,14 @@ FROM python:3.11-slim
 WORKDIR /usr/src/app
 
 # --- FIX: Install System Dependencies for Compilation ---
-# These packages provide the necessary C/C++ compilers and linear algebra libraries 
-# (BLAS/LAPACK) that scikit-learn, numpy, and pandas require to build from source.
+# These packages provide the necessary C/C++ compilers, the Fortran compiler, and the 
+# high-performance linear algebra library (OpenBLAS) required by scikit-learn and numpy.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gcc \
     g++ \
-    libatlas-base-dev \
+    gfortran \
+    libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 # --- END FIX ---
 
