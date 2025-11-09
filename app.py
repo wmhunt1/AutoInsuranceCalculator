@@ -2,21 +2,18 @@
 """
 Flask API for Telematics Risk Modeling.
 
-Converts the original CLI logic into a RESTful API for a modern frontend.
-This version includes flask-cors for cross-origin resource sharing, which is
-essential for a decoupled architecture (like a React frontend on a different domain).
+This version includes the corrected CORS policy to resolve cross-origin issues
+when connecting a local frontend (e.g., index.html) to the remote Railway API.
+It also includes the /create_user endpoint.
 """
 
 # --- FLASK IMPORTS ---
 from flask import Flask, request, jsonify
-from flask_cors import CORS # New Import for CORS
+from flask_cors import CORS 
 
 # --- CORE LIBRARIES IMPORTS ---
 from typing import List, Optional, Any
 import os
-import sys
-import argparse
-import re
 import time
 import hashlib 
 import random 
@@ -26,38 +23,28 @@ import string
 import pandas as pd
 import numpy as np
 from pymongo import MongoClient
-# from dotenv import load_dotenv # REMOVED: Railway injects environment variables directly
-from bson.objectid import ObjectId # Needed for MongoDB _id conversion
+from bson.objectid import ObjectId 
 
 # --- SKLEARN FOR MODELING ---
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 
-# Load environment variables from the .env file - REMOVING THIS LINE
-# load_dotenv()
-
 # --- FLASK APP INSTANCE ---
 app = Flask(__name__)
 
-# --- CRITICAL STEP: CONFIGURE CORS ---
-# You must update this with your actual GitHub Pages URL later for security.
-# For now, we allow all origins ('*') for easy testing, but restrict methods.
+# --- CRITICAL STEP: CONFIGURE CORS (FIXED) ---
+# FIX: Using origins="*" allows local file testing (file://) and unknown origins 
+# to access the API. This resolves the browser's CORS block.
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
-# NOTE: The default here is for local testing. In Railway, this MUST be overridden
-# by the MONGO_URI variable injected by the MongoDB plugin.
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
-RAW_DATA_COLLECTION = "raw_telematics"
-CLAIMS_COLLECTION = "claims_history"
 USERS_COLLECTION = "users" 
-DEVICE_COL_CANDIDATES = ["device_id", "deviceid", "deviceId", "DeviceId", "device", "id", "ID"]
-VALUE_COL_CANDIDATES = ["value", "values", "Value", "Values"]
 CLAIMS_FILE_NAME = "Claims_History.csv"
 FEATURES_FILE_NAME = "Telematics_Risk_Features_FULL.csv"
 
-# --- UTILITY AND CORE LOGIC FUNCTIONS (Modified to fit API needs) ---
+# --- UTILITY AND CORE LOGIC FUNCTIONS ---
 
 def get_mongo_client():
     """Returns a connected MongoClient using the URI."""
@@ -72,6 +59,23 @@ def hash_password(password: str, salt: str = "secure_salt") -> str:
 def verify_password(stored_hash: str, provided_password: str, salt: str = "secure_salt") -> bool:
     """Verifies a provided password against a stored hash."""
     return stored_hash == hash_password(provided_password, salt)
+
+def get_user_by_credentials(username: str, password: str):
+    """Fetches a user document from MongoDB and verifies the password."""
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            user_data = collection.find_one({"username": username})
+            
+            if user_data:
+                if verify_password(user_data['hashed_password'], password):
+                    return user_data
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error fetching user data from MongoDB: {e}")
+        return None
 
 def create_new_user(username: str, password: str, name: str, source_device_id: str, device_id: str):
     """Creates a new user in MongoDB with initial data."""
@@ -90,7 +94,7 @@ def create_new_user(username: str, password: str, name: str, source_device_id: s
                 "name": name,
                 "hashed_password": hash_password(password),
                 "device_id": device_id,
-                "source_device_id": source_device_id, # Source ID for telematics data
+                "source_device_id": source_device_id, 
                 "created_at": time.time()
             }
             
@@ -103,22 +107,6 @@ def create_new_user(username: str, password: str, name: str, source_device_id: s
         print(f"❌ Error creating user in MongoDB: {e}")
         return {"error": f"Database error during creation: {e}"}, None
 
-def get_user_by_credentials(username: str, password: str):
-    """Fetches a user document from MongoDB and verifies the password."""
-    try:
-        with get_mongo_client() as client:
-            db = client[DATABASE_NAME]
-            collection = db[USERS_COLLECTION]
-            user_data = collection.find_one({"username": username})
-            
-            if user_data:
-                if verify_password(user_data['hashed_password'], password):
-                    return user_data
-            return None
-                
-    except Exception as e:
-        print(f"❌ Error fetching user data from MongoDB: {e}")
-        return None
 
 def load_csv(path: str) -> Optional[pd.DataFrame]:
     """Loads the CSV file and handles errors, returns None on failure."""
@@ -157,20 +145,17 @@ def calculate_all_features(device_id: Optional[str], source_device_id: Optional[
             
     position_df = df[df['variable'] == 'POSITION'].copy()
     if position_df.empty: 
-        # Create a zero-feature DataFrame for missing data
         if device_id:
-             return pd.DataFrame({'deviceId': [device_id], 'total_distance_km': [0.0], 'hard_brake_rate_per_1000km': [0.0], 'hard_accel_rate_per_1000km': [0.0], 'percent_time_high_speed': [0.0]})
+            return pd.DataFrame({'deviceId': [device_id], 'total_distance_km': [0.0], 'hard_brake_rate_per_1000km': [0.0], 'hard_accel_rate_per_1000km': [0.0], 'percent_time_high_speed': [0.0]})
         return None
         
-    # ... (Lat/Lon extraction, time prep, distance, speed, acceleration/deceleration logic)
-    # Handle the 'value' column extraction (coordinate parsing)
     parts = position_df['value'].astype(str).str.split(r'[,;\s]+', n=2, expand=True)
     position_df.loc[:, 'latitude'] = pd.to_numeric(parts.iloc[:, 0], errors='coerce')
     position_df.loc[:, 'longitude'] = pd.to_numeric(parts.iloc[:, 1], errors='coerce')
     position_df.dropna(subset=['latitude', 'longitude'], inplace=True)
     if position_df.empty:
         if device_id:
-             return pd.DataFrame({'deviceId': [device_id], 'total_distance_km': [0.0], 'hard_brake_rate_per_1000km': [0.0], 'hard_accel_rate_per_1000km': [0.0], 'percent_time_high_speed': [0.0]})
+            return pd.DataFrame({'deviceId': [device_id], 'total_distance_km': [0.0], 'hard_brake_rate_per_1000km': [0.0], 'hard_accel_rate_per_1000km': [0.0], 'percent_time_high_speed': [0.0]})
         return None
         
     position_df['datetime'] = pd.to_datetime(position_df['timestamp'])
@@ -238,7 +223,6 @@ def calculate_all_features(device_id: Optional[str], source_device_id: Optional[
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left').fillna(0)
 
     if filter_id and device_id and (filter_id != device_id):
-        # If running for a new user, replace the deviceId in the output
         final_risk_features.loc[:, 'deviceId'] = device_id
         
     return final_risk_features[['deviceId', 'total_distance_km', 'hard_brake_rate_per_1000km', 'hard_accel_rate_per_1000km', 'percent_time_high_speed']]
@@ -267,25 +251,22 @@ def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     return float(premium), quote_message
 
 def get_premium_estimates_for_api(user_data) -> dict:
-    """
-    Core logic to calculate estimates, modified to RETURN a dictionary 
-    instead of printing results, suitable for API response.
-    """
+    """Core logic to calculate estimates for API response."""
     device_id = user_data['device_id']
     source_device_id = user_data.get('source_device_id', device_id)
+    name = user_data.get('name', 'User')
     
     # 1. Load Data for Internal Model
     final_risk_features = load_csv(FEATURES_FILE_NAME)
     claims_data = load_csv(CLAIMS_FILE_NAME)
 
     if final_risk_features is None or claims_data is None:
-        return {"error": "Required feature or claims files not found on the server. Please run the batch feature calculation first."}
+        return {"error": "Required feature or claims files not found on the server. Please ensure data files are present."}
 
     # Filter features based on the data source ID
     target_features_df = final_risk_features[final_risk_features['deviceId'].astype(str) == str(source_device_id)].copy()
     
     if target_features_df.empty:
-        # Calculate features in real-time if missing from the batch file
         target_features_df = calculate_all_features(device_id=device_id, source_device_id=source_device_id)
         if target_features_df is None or target_features_df.empty:
             return {"error": "Could not generate real-time features. Cannot provide an estimate."}
@@ -318,8 +299,9 @@ def get_premium_estimates_for_api(user_data) -> dict:
     # 5. Prepare the API response structure
     return {
         "user_info": {
-            "name": user_data['name'],
+            "name": name,
             "device_id": device_id,
+            "source_device_id": source_device_id,
             "has_claim_history": bool(user_data.get('has_claim', 0))
         },
         "telematics_features": {
@@ -356,10 +338,8 @@ def login_route():
     user_data = get_user_by_credentials(username, password)
     
     if user_data:
-        # Ensure MongoDB ObjectId is converted to a serializable string
         if '_id' in user_data:
             user_data['_id'] = str(user_data['_id'])
-        # Remove the hashed password before sending to the frontend
         if 'hashed_password' in user_data:
             del user_data['hashed_password'] 
 
@@ -370,6 +350,7 @@ def login_route():
     else:
         return jsonify({"error": "Invalid username or password"}), 401
 
+# NEW ROUTE: Handles user creation
 @app.route('/create_user', methods=['POST'])
 def create_user_route():
     """Handles new user creation."""
@@ -380,9 +361,9 @@ def create_user_route():
     username = data.get('username')
     password = data.get('password')
     name = data.get('name', username)
-    # New users default to their own device_id as source_device_id
+    # Assign a unique placeholder device ID, and use a default existing source ID 
     device_id = data.get('device_id', 'NEW_USER_' + ''.join(random.choices(string.digits, k=5)))
-    source_device_id = data.get('source_device_id', 'driver1') # Default new users to existing data source for estimate demo
+    source_device_id = data.get('source_device_id', 'driver1') 
 
     if not all([username, password]):
         return jsonify({"error": "Username and password are required."}), 400
@@ -390,14 +371,14 @@ def create_user_route():
     error, new_user = create_new_user(username, password, name, source_device_id, device_id)
     
     if error:
-        return jsonify(error), 409 # 409 Conflict if username exists
+        status_code = 409 if 'Username already exists' in error['error'] else 500
+        return jsonify(error), status_code
     else:
         return jsonify({
             "message": "User created and logged in successfully",
             "user": new_user
         }), 201
-        
-        
+
 @app.route('/features', methods=['POST'])
 def get_features_route():
     """Calculates and returns the user's latest telematics features."""
@@ -413,10 +394,8 @@ def get_features_route():
     if features_df is None or features_df.empty:
         return jsonify({"error": f"Failed to calculate features for device {device_id}."}), 500
 
-    # Convert DataFrame row to dictionary for JSON output
     features_dict = features_df.iloc[0].to_dict()
 
-    # Ensure all numpy float types are converted to standard Python floats for JSON
     for key, value in features_dict.items():
         if isinstance(value, np.float64):
             features_dict[key] = float(value)
@@ -438,9 +417,6 @@ def get_estimate_route():
     return jsonify(results), 200
 
 # --- MAIN RUN BLOCK ---
-# NOTE: This block is primarily for local testing (python app.py). 
-# The Docker CMD will use Gunicorn for production instead.
-
 if __name__ == '__main__':
     print("\n----------------------------------------------------")
     print("🚀 Telematics Risk Model API is STARTING...")
