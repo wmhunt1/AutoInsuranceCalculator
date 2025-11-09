@@ -1,15 +1,15 @@
-﻿
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Flask API for Telematics Risk Modeling.
 
 Converts the original CLI logic into a RESTful API for a modern frontend.
-All necessary imports and utility functions from the original script are included.
+This version includes flask-cors for cross-origin resource sharing, which is
+essential for a decoupled architecture (like a React frontend on a different domain).
 """
 
 # --- FLASK IMPORTS ---
 from flask import Flask, request, jsonify
-from flask_cors import CORS # Import the CORS module
+from flask_cors import CORS # New Import for CORS
 
 # --- CORE LIBRARIES IMPORTS ---
 from typing import List, Optional, Any
@@ -26,26 +26,27 @@ import string
 import pandas as pd
 import numpy as np
 from pymongo import MongoClient
-from dotenv import load_dotenv
+# from dotenv import load_dotenv # REMOVED: Railway injects environment variables directly
 from bson.objectid import ObjectId # Needed for MongoDB _id conversion
 
 # --- SKLEARN FOR MODELING ---
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 
-# Load environment variables from the .env file
-load_dotenv()
+# Load environment variables from the .env file - REMOVING THIS LINE
+# load_dotenv()
 
 # --- FLASK APP INSTANCE ---
 app = Flask(__name__)
 
+# --- CRITICAL STEP: CONFIGURE CORS ---
+# You must update this with your actual GitHub Pages URL later for security.
+# For now, we allow all origins ('*') for easy testing, but restrict methods.
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
+
 # --- CONFIGURATION (UNCHANGED) ---
-CORS_ORIGIN = ["https://github.com/wmhunt1.io"] 
-
-# If you want to allow multiple specific domains (for safety):
-
-CORS(app, resources={r"/*": {"origins": CORS_ORIGIN}})
-
+# NOTE: The default here is for local testing. In Railway, this MUST be overridden
+# by the MONGO_URI variable injected by the MongoDB plugin.
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
 RAW_DATA_COLLECTION = "raw_telematics"
@@ -130,7 +131,7 @@ def calculate_all_features(device_id: Optional[str], source_device_id: Optional[
         if device_id:
              return pd.DataFrame({'deviceId': [device_id], 'total_distance_km': [0.0], 'hard_brake_rate_per_1000km': [0.0], 'hard_accel_rate_per_1000km': [0.0], 'percent_time_high_speed': [0.0]})
         return None
-    
+        
     # ... (Lat/Lon extraction, time prep, distance, speed, acceleration/deceleration logic)
     # Handle the 'value' column extraction (coordinate parsing)
     parts = position_df['value'].astype(str).str.split(r'[,;\s]+', n=2, expand=True)
@@ -379,14 +380,13 @@ def get_estimate_route():
     return jsonify(results), 200
 
 # --- MAIN RUN BLOCK ---
+# NOTE: This block is primarily for local testing (python app.py). 
+# The Docker CMD will use Gunicorn for production instead.
 
 if __name__ == '__main__':
-    # To run this API, save it as a file (e.g., app.py) and execute:
-    # python app.py
     print("\n----------------------------------------------------")
     print("🚀 Telematics Risk Model API is STARTING...")
     print(f"MongoDB URI: {MONGO_URI}")
-    print(f"Required Files: {FEATURES_FILE_NAME}, {CLAIMS_FILE_NAME}")
     print("Access the API at: http://127.0.0.1:5000/")
     print("----------------------------------------------------\n")
     app.run(debug=True)
