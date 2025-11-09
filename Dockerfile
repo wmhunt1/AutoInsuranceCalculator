@@ -5,7 +5,7 @@ WORKDIR /usr/src/app
 
 # 2. Install Build Dependencies: These are critical for compiling binary packages (like pandas/numpy)
 # 'apk add' installs tools like gcc (C compiler) and musl-dev (C library headers)
-RUN apk add --no-cache gcc g++ musl-dev openblas-dev
+RUN apk add --no-cache gcc g++ musl-dev openblas-dev gfortran
 
 # 3. Copy and Install Python Dependencies
 # Copy requirements first to leverage Docker's layer caching
