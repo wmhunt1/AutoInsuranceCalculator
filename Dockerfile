@@ -1,12 +1,13 @@
-# We start with the official Python image
+# Use a slim, stable Python base image
 FROM python:3.11-slim
 
 # Set the working directory inside the container
 WORKDIR /usr/src/app
 
-# --- FIX: Install System Dependencies for Compilation ---
-# These packages provide the necessary C/C++ compilers, the Fortran compiler, and the 
-# high-performance linear algebra library (OpenBLAS) required by scikit-learn and numpy.
+# --- 1. Install System Dependencies for Compilation ---
+# These packages (gcc, g++, gfortran, libopenblas-dev) are crucial for 
+# successfully compiling heavy Python packages like numpy and scikit-learn
+# on the Debian-based slim image.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gcc \
@@ -14,20 +15,20 @@ RUN apt-get update && \
     gfortran \
     libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
-# --- END FIX ---
+# --- END SYSTEM DEPENDENCIES ---
 
-# Copy the requirements file into the working directory
+# Copy the requirements file and install Python dependencies
+# This step must run after the system dependencies are installed.
 COPY requirements.txt ./
-
-# Install the Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy the rest of the application code (app.py, Telematicsdata.csv, etc.)
 COPY . .
 
 # Expose the port your Flask application runs on
 EXPOSE 5000
 
-# Define the production command using Gunicorn
-# FIX: Using 'python -m gunicorn' ensures the executable is found reliably within the Python environment.
-CMD ["python", "-m", "gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
+# --- 2. Robust Startup Command (Shell Form) ---
+# Using the SHELL form (without brackets) is the most reliable way to execute 
+# the 'gunicorn' command and ensure its path is correctly resolved on startup.
+CMD gunicorn -w 4 -b 0.0.0.0:5000 app:app
