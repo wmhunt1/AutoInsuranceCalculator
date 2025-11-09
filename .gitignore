@@ -374,3 +374,4 @@ venv/
 
 # Data files that should not be committed (like your generated features)
 Telematics_Risk_Features_FULL.csv
+.csv

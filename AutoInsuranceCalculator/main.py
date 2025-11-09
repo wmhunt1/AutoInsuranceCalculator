@@ -2,10 +2,8 @@
 """
 Simple console app for Telematics Risk Modeling.
 
-This script loads data, calculates risk features (Exposure, Maneuver, Speed), 
-and uses a Logistic Regression model (with placeholder claims data) to predict 
-a risk score and premium tier. It also contains functionality to migrate 
-CSV files to MongoDB, keeping credentials secure via a .env file.
+This script implements a two-tiered CLI: a Login menu to select a user and 
+a Session menu to run feature engineering and prediction for that user's device.
 """
 
 from typing import List, Optional
@@ -18,23 +16,22 @@ import re
 import pandas as pd
 import numpy as np
 from pymongo import MongoClient
-from pymongo.server_api import ServerApi
 from dotenv import load_dotenv
 
 # --- SKLEARN FOR MODELING ---
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt # Not needed in CLI version
 
-# Load environment variables (must happen early)
+# Load environment variables from the .env file
 load_dotenv()
 
 # --- MongoDB Connection Details ---
-# Reads the URI from the .env file. Falls back to local host if not found.
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
 RAW_DATA_COLLECTION = "raw_telematics"
 CLAIMS_COLLECTION = "claims_history"
+USERS_COLLECTION = "users" # <--- NEW COLLECTION
 
 # --- CONSTANTS ---
 DEVICE_COL_CANDIDATES = [
@@ -50,7 +47,7 @@ CLAIMS_FILE_NAME = "Claims_History.csv"
 FEATURES_FILE_NAME = "Telematics_Risk_Features_FULL.csv"
 
 
-# --- UTILITY FUNCTIONS (Unchanged for brevity) ---
+# --- UTILITY FUNCTIONS ---
 
 def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     """Tries to find the correct column name (case-insensitive) from a list of candidates."""
@@ -180,6 +177,7 @@ def display_data(df: pd.DataFrame, device_col: str | None) -> None:
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """
     Calculates the great-circle distance (in km) between two latitude/longitude points.
+    This function is now designed to take Pandas Series or NumPy arrays (vectorized).
     """
     # Convert degrees to radians
     lat1_rad = np.radians(lat1)
@@ -195,33 +193,177 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     
     return R * c
 
-# --- CORE FEATURE ENGINEERING ---
 
-def calculate_all_features():
+# --- NEW USER MANAGEMENT FUNCTIONS ---
+
+def get_mongo_client():
+    """Returns a connected MongoClient using the URI."""
+    return MongoClient(MONGO_URI)
+
+def load_sample_users():
+    """Defines and loads sample user data into the MongoDB users collection."""
+    print("\n--- Loading Sample User Data ---")
+    
+    # NOTE: You must replace the device_id below with real IDs from your Telematicsdata.csv 
+    # if you want to test with real data.
+    sample_users = [
+        {"user_id": "user_one_id", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
+        {"user_id": "user_two_id", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
+        {"user_id": "user_three_id", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
+    ]
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # Clear existing data and insert new data
+            collection.delete_many({})
+            result = collection.insert_many(sample_users)
+            
+            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}'.")
+            print("--- Sample Users Loaded ---")
+            for i, user in enumerate(sample_users):
+                print(f"[{i+1}] {user['name']} (Device: {user['device_id']})")
+                
+    except Exception as e:
+        print(f"❌ Failed to load sample users. Error: {e}")
+
+def get_user_by_selection(choice: str):
+    """Fetches a user document from MongoDB based on the numeric menu choice."""
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # Find the user based on the selected index
+            users_list = list(collection.find({}))
+            index = int(choice) - 1
+            
+            if 0 <= index < len(users_list):
+                return users_list[index]
+            else:
+                print("Invalid user selection.")
+                return None
+                
+    except Exception as e:
+        print(f"❌ Error fetching user data. Did you run the migration/load users? Error: {e}")
+        return None
+
+# --- MONGODB MIGRATION LOGIC ---
+
+def migrate_csv_to_mongodb(csv_file_path: str, collection_name: str, client: MongoClient):
+    """Loads a CSV file and inserts its records into the specified MongoDB collection."""
+    print(f"\nAttempting to load data from: {csv_file_path}")
+    try:
+        df = pd.read_csv(csv_file_path)
+    except FileNotFoundError:
+        print(f"Error: File not found at {csv_file_path}. Skipping migration for this file.")
+        return
+    data_records = df.to_dict('records')
+    db = client[DATABASE_NAME]
+    collection = db[collection_name]
+    try:
+        if data_records:
+            result = collection.insert_many(data_records)
+            print(f"✅ Successfully inserted {len(result.inserted_ids)} records into '{collection_name}'.")
+        else:
+            print(f"Warning: CSV file {csv_file_path} was empty.")
+    except Exception as e:
+        print(f"❌ An error occurred during MongoDB insert for {collection_name}: {e}")
+
+def run_migration():
+    """Establishes MongoDB connection and runs the migration for all CSV files."""
+    try:
+        print(f"\n--- Attempting connection to MongoDB at: {MONGO_URI} ---")
+        with get_mongo_client() as client:
+            client.admin.command('ping')
+            print("✨ Successfully connected to MongoDB.")
+            migrate_csv_to_mongodb("Telematicsdata.csv", RAW_DATA_COLLECTION, client)
+            migrate_csv_to_mongodb(CLAIMS_FILE_NAME, CLAIMS_COLLECTION, client)
+    except Exception as e:
+        print(f"🚨 FAILED to connect to MongoDB. Error: {e}")
+
+# --- CORE FEATURE ENGINEERING (Updated to accept device_id) ---
+
+def calculate_all_features(device_id: Optional[str]):
     """
-    Performs the full feature engineering pipeline:
-    [1] Calculate Exposure (Distance/Time), Maneuver Risk, and Speed Risk.
-    Saves the final aggregated features per device to Telematics_Risk_Features_FULL.csv.
+    Performs the full feature engineering pipeline, either for a single device 
+    or for ALL devices if device_id is None.
     """
-    print("\n--- Running Feature Engineering Pipeline ---")
+    mode = device_id if device_id else 'ALL'
+    print(f"\n--- Running Feature Engineering Pipeline for Device: {mode} ---")
     
     # 1. INITIAL DATA PREPARATION
     df = load_csv("Telematicsdata.csv")
+    
+    # Filter by device ID immediately if specified
+    if device_id:
+        df = df[df['deviceId'].astype(str) == str(device_id)].copy()
+        if df.empty:
+            print(f"Error: No data found for device ID: {device_id}")
+            return
+            
     position_df = df[df['variable'] == 'POSITION'].copy()
+    
+    # Check if any POSITION data exists for the filtered device(s)
+    if position_df.empty:
+        print(f"Warning: No 'POSITION' data found for device {mode}. Cannot calculate movement features.")
+        # If running for a single device, display placeholder features
+        if device_id:
+            final_risk_features = pd.DataFrame({
+                'deviceId': [device_id], 
+                'total_distance_km': [0.0],
+                'hard_brake_rate_per_1000km': [0.0],
+                'hard_accel_rate_per_1000km': [0.0],
+                'percent_time_high_speed': [0.0]
+            })
+            print(f"\n✅ Features for Device {device_id} Calculated:")
+            print(final_risk_features.head(1).to_string(index=False))
+        return
+    
+    # Handle the 'value' column extraction
     parts = position_df['value'].str.split(',', expand=True)
-    position_df['latitude'] = pd.to_numeric(parts[0], errors='coerce')
-    position_df['longitude'] = pd.to_numeric(parts[1], errors='coerce')
+    
+    # Use .loc to ensure the columns are created and assigned correctly.
+    position_df.loc[:, 'latitude'] = pd.to_numeric(parts.iloc[:, 0], errors='coerce')
+    position_df.loc[:, 'longitude'] = pd.to_numeric(parts.iloc[:, 1], errors='coerce')
+
     position_df.dropna(subset=['latitude', 'longitude'], inplace=True)
+    
+    # Re-check for empty data after dropping NaNs
+    if position_df.empty:
+        print(f"Warning: No valid coordinate data found after cleaning for device {mode}. Cannot calculate movement features.")
+        if device_id:
+            final_risk_features = pd.DataFrame({
+                'deviceId': [device_id], 
+                'total_distance_km': [0.0],
+                'hard_brake_rate_per_1000km': [0.0],
+                'hard_accel_rate_per_1000km': [0.0],
+                'percent_time_high_speed': [0.0]
+            })
+            print(f"\n✅ Features for Device {device_id} Calculated:")
+            print(final_risk_features.head(1).to_string(index=False))
+        return
+
+    # Prepare time columns
     position_df['datetime'] = pd.to_datetime(position_df['timestamp'])
     position_df['time_sec'] = position_df['datetime'].astype(np.int64) // 10**9
-
+    
     grouped = position_df.groupby('deviceId')
 
-    # Calculate Distance, Time Diff, and Speed
-    position_df['distance_km'] = grouped.apply(lambda x: haversine_distance(
-        x['latitude'].shift(1), x['longitude'].shift(1),
-        x['latitude'], x['longitude']
-    )).reset_index(level=0, drop=True)
+    # --- FIX APPLIED: Create Lagged Columns first, then calculate vectorially ---
+    print("-> Calculating distance using grouped lagged coordinates...")
+    # 1. Create lagged columns using groupby().shift(1)
+    position_df.loc[:, 'latitude_prev'] = grouped['latitude'].shift(1)
+    position_df.loc[:, 'longitude_prev'] = grouped['longitude'].shift(1)
+    
+    # 2. Calculate distance vectorially across the entire dataframe
+    position_df.loc[:, 'distance_km'] = haversine_distance(
+        position_df['latitude_prev'], position_df['longitude_prev'],
+        position_df['latitude'], position_df['longitude']
+    )
+    # --------------------------------------------------------------------------
+    
     position_df['time_diff_sec'] = grouped['time_sec'].diff() 
     position_df['speed_kmh'] = np.where(
         position_df['time_diff_sec'] > 0,
@@ -277,178 +419,154 @@ def calculate_all_features():
     speed_risk_df = pd.merge(total_time_moving, high_speed_time, on='deviceId', how='left').fillna(0)
     speed_risk_df['percent_time_high_speed'] = (speed_risk_df['time_high_speed_sec'] / speed_risk_df['total_time_moving_sec'].replace(0, 1e-6)) * 100
     
-    # --- Final Merge and Save ---
+    # --- Final Merge and Save/Display ---
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left')
     
-    final_risk_features.to_csv(FEATURES_FILE_NAME, index=False)
-    
-    print(f"\nSuccessfully generated {len(final_risk_features)} device features.")
-    print(f"Final feature table saved to: {FEATURES_FILE_NAME}")
-    print("\n--- Summary of Final Features (First 3 Devices) ---")
-    print(final_risk_features.head(3).to_string(index=False))
+    if device_id:
+        print(f"\n✅ Features for Device {device_id} Calculated:")
+        # Display only the features for the single device
+        print(final_risk_features.head(1).to_string(index=False))
+        # Do not save to file when running for a single user session
+    else:
+        # Only save the full file if we processed ALL devices (Batch Mode)
+        final_risk_features.to_csv(FEATURES_FILE_NAME, index=False)
+        print(f"\nSuccessfully generated {len(final_risk_features)} device features.")
+        print(f"Final feature table saved to: {FEATURES_FILE_NAME}")
 
 
-def calculate_insurance_rate():
+# --- CORE PREDICTION (Updated to accept device_id) ---
+
+def calculate_insurance_rate(device_id: str):
     """
-    [4] Calculate Insurance Rate - Implements Logistic Regression using features 
-    and the Claims_History.csv target variable.
+    Calculates Insurance Rate by training a model on the batch feature file
+    and predicting the risk score for the specified single device.
     """
-    print("\n--- [4] Calculate Insurance Rate (Predicting Risk Score) ---")
     
-    # Check if features file exists (must run [1] first)
-    if not os.path.exists(FEATURES_FILE_NAME):
-        print(f"Error: Risk features file '{FEATURES_FILE_NAME}' not found. Please run [1] Calculate All Features first.")
-        return
-        
-    # Check if claims file exists (must be generated/provided)
-    if not os.path.exists(CLAIMS_FILE_NAME):
-        print(f"Error: Claims history file '{CLAIMS_FILE_NAME}' not found. Please generate it first.")
+    print(f"\n--- [4] Calculate Insurance Rate (Predicting Risk Score) for Device: {device_id} ---")
+    
+    # Check dependencies (requires features and claims files for model training)
+    if not os.path.exists(FEATURES_FILE_NAME) or not os.path.exists(CLAIMS_FILE_NAME):
+        print(f"Error: Required feature or claims files not found.")
+        print("Please run **[4] Calculate ALL Features and SAVE (Batch Mode)** first to train the model.")
         return
 
-    # 1. LOAD DATA
+    # 1. LOAD DATA (Full dataset for training, target features for prediction)
     final_risk_features = pd.read_csv(FEATURES_FILE_NAME)
     claims_data = pd.read_csv(CLAIMS_FILE_NAME)
 
-    # 2. MERGE: Combine Features (X) with Target (Y)
-    print("-> Merging features with claims data to get the target variable (Y)...")
-    model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
-    # Fill NaN claims with 0 (assuming devices with no match had no claim in the period)
-    model_data['has_claim'] = model_data['has_claim'].fillna(0).astype(int)
+    # Filter feature set down to the target device
+    target_features = final_risk_features[final_risk_features['deviceId'].astype(str) == str(device_id)].copy()
+    if target_features.empty:
+        print(f"Error: No features found in {FEATURES_FILE_NAME} for device ID: {device_id}")
+        print("Did you run [4] Calculate ALL Features after adding your device's data?")
+        return
 
-    # --- MODEL PREPARATION ---
-    # Define Features (X) and Target (Y)
+    # --- MODEL PREPARATION & TRAINING (Using full dataset for training) ---
     features = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
+    full_model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
+    full_y = full_model_data['has_claim'].fillna(0).astype(int)
     
-    # Check for features availability
-    missing_features = [f for f in features if f not in model_data.columns]
-    if missing_features:
-        print(f"Error: Missing features in model data: {missing_features}. Cannot run prediction.")
+    if full_y.nunique() <= 1:
+        print("Warning: Target variable 'has_claim' is constant across all data. Skipping prediction.")
         return
 
-    X = model_data[features]
-    y = model_data['has_claim']
-
-    # Handle cases where all target values are the same (prevents model crash)
-    if y.nunique() <= 1:
-        print("Warning: Target variable 'has_claim' is constant. Cannot train model. Skipping prediction.")
-        return
-
-    # Split the data into training (70%) and testing (30%) sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    print("-> Training Logistic Regression Model on full batch data...")
+    X_train, _, y_train, _ = train_test_split(full_model_data[features], full_y, test_size=0.01, random_state=42)
     
-    # --- MODEL TRAINING AND PREDICTION ---
-    print(f"-> Training Logistic Regression Model on {len(X_train)} training records...")
-    
-    # 1. Train the Logistic Regression model
-    model = LogisticRegression(random_state=42, solver='liblinear') # using liblinear for stability on small datasets
+    model = LogisticRegression(random_state=42, solver='liblinear')
     model.fit(X_train, y_train)
 
-    # 2. Predict Risk Probability (Score) for ALL data points
-    # [:, 1] extracts the probability of the positive class (i.e., probability of a claim = 1)
-    risk_probabilities = model.predict_proba(X)[:, 1]
-    model_data['risk_score'] = risk_probabilities
+    # 2. Predict Risk Probability (Score)
+    X_predict = target_features[features]
+    risk_probabilities = model.predict_proba(X_predict)[:, 1]
+    
+    target_features['risk_score'] = risk_probabilities
     
     # 3. Apply a Risk Tier based on the predicted probability
-    HIGH_RISK_PROBABILITY_THRESHOLD = 0.55 # Example cutoff
-    model_data['final_rate'] = np.where(
-        model_data['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
+    HIGH_RISK_PROBABILITY_THRESHOLD = 0.55
+    target_features['final_rate'] = np.where(
+        target_features['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
         'High Premium (Predicted Risk)', 
         'Standard Premium'
     )
     
-    print("\n-> Prediction Summary (Highest Risk Devices) ---")
-    prediction_summary = model_data[[
-        'deviceId', 'has_claim', 'hard_brake_rate_per_1000km', 
+    print("\n-> Prediction Summary ---")
+    print(target_features[[
+        'deviceId', 'hard_brake_rate_per_1000km', 
         'percent_time_high_speed', 'risk_score', 'final_rate'
-    ]].sort_values(by='risk_score', ascending=False)
-    
-    print(prediction_summary.head(10).to_string(index=False))
+    ]].to_string(index=False))
     print("\nPrediction complete. The 'risk_score' is the predicted probability of a claim.")
 
-# --- MONGODB MIGRATION LOGIC ---
 
-def migrate_csv_to_mongodb(csv_file_path: str, collection_name: str, client: MongoClient):
-    """
-    Loads a CSV file and inserts its records into the specified MongoDB collection.
-    """
-    print(f"\nAttempting to load data from: {csv_file_path}")
-    
-    # 1. Load CSV data into a Pandas DataFrame
-    try:
-        df = pd.read_csv(csv_file_path)
-    except FileNotFoundError:
-        print(f"Error: File not found at {csv_file_path}. Skipping migration for this file.")
-        return
+# --- CLI EXECUTION LOOPS ---
 
-    # 2. Convert the DataFrame to a list of Python dictionaries (JSON-like documents)
-    data_records = df.to_dict('records')
-    
-    # 3. Get the database and collection
-    db = client[DATABASE_NAME]
-    collection = db[collection_name]
-    
-    # 4. Insert the data
-    try:
-        if data_records:
-            # Clear collection before inserting to ensure a clean run
-            # WARNING: Uncommenting this will delete ALL existing data in the collection
-            # collection.delete_many({}) 
-            result = collection.insert_many(data_records)
-            print(f"✅ Successfully inserted {len(result.inserted_ids)} records into '{collection_name}'.")
-        else:
-            print(f"Warning: CSV file {csv_file_path} was empty.")
-    except Exception as e:
-        print(f"❌ An error occurred during MongoDB insert for {collection_name}: {e}")
-
-def run_migration():
-    """Establishes MongoDB connection and runs the migration for all CSV files."""
-    try:
-        # Use a 'with' statement to ensure the connection is closed automatically
-        print(f"\n--- Attempting connection to MongoDB at: {MONGO_URI} ---")
-        with MongoClient(MONGO_URI) as client:
-            # The server_api is often required for modern Atlas clusters
-            # client = MongoClient(MONGO_URI, server_api=ServerApi('1')) 
-            
-            client.admin.command('ping')
-            print("✨ Successfully connected to MongoDB.")
-            
-            # 1. Migrate the large raw data file
-            migrate_csv_to_mongodb("Telematicsdata.csv", RAW_DATA_COLLECTION, client)
-            
-            # 2. Migrate the smaller claims history file
-            migrate_csv_to_mongodb(CLAIMS_FILE_NAME, CLAIMS_COLLECTION, client)
-            
-    except Exception as e:
-        print(f"🚨 FAILED to connect to MongoDB. Please check your MONGO_URI, network access, and firewall settings. Error: {e}")
-
-
-# --- MAIN CLI EXECUTION ---
-
-def main():
-    """The main command line interface loop."""
+def session_main(user_data):
+    """The main CLI loop run after a user has logged in."""
+    user_name = user_data['name']
+    device_id = user_data['device_id']
     running = True
+    
+    print(f"\n🔑 Logged in as: {user_name} (Device ID: {device_id})")
+    
     while running:
         
         print("\n=======================================")
-        print(" Welcome to the Telematics Risk Model CLI")
+        print(f" 👤 Session Menu for: {user_name}")
         print("=======================================")
-        print("[1] Calculate All Features (Exposure, Maneuver, Speed)")
-        print("[2] Calculate Insurance Rate (Run Logistic Regression Model)")
-        print("[3] MIGRATE CSV DATA TO MONGODB (One-time setup)")
-        print("[9] Display Test Data (Raw POSITION rows)")
-        print("[0] Quit")
+        print("[1] Calculate Features for MY Device (Real-Time)")
+        print("[2] Predict Insurance Rate for MY Device (Model Score)")
+        print("---------------------------------------")
+        print("[4] Calculate ALL Features and SAVE (Batch Mode - Required for [2])")
+        print("[9] Display Test Data (Raw POSITION rows for ALL devices)")
+        print("[0] Log Out")
         choice = input("Selection: ").strip().lower()
 
         match choice:
             case "1":
-                calculate_all_features()
+                calculate_all_features(device_id)
             case "2":
-                calculate_insurance_rate()
-            case "3":
-                run_migration()
+                calculate_insurance_rate(device_id)
+            case "4":
+                # Original batch mode (no device ID) - runs on all data
+                calculate_all_features(device_id=None)
             case "9":
                 df, device_col = retrieve_data("POSITION")
                 display_data(df, device_col)
+            case "0":
+                print(f"👋 {user_name} logged out.")
+                running = False
+            case _:
+                print("Invalid selection. Please choose a valid option.")
+
+def login_main():
+    """The outermost CLI loop for user selection and application setup."""
+    running = True
+    while running:
+        
+        print("\n=======================================")
+        print(" 💻 Telematics Risk Model: LOGIN/SETUP")
+        print("=======================================")
+        print("Select User to Log In:")
+        print("[1] User One (Alice Smith)")
+        print("[2] User Two (Bob Johnson)")
+        print("[3] User Three (Charlie Brown)")
+        print("---------------------------------------")
+        print("[8] Run MongoDB CSV Migration 🚀 (One-Time)")
+        print("[9] Load Sample Users 🧑‍💻 (One-Time)")
+        print("[0] Quit Application")
+        
+        choice = input("Selection: ").strip()
+
+        match choice:
+            case "1" | "2" | "3":
+                user_data = get_user_by_selection(choice)
+                if user_data:
+                    # Pass control to the session menu
+                    session_main(user_data)
+            case "8":
+                run_migration()
+            case "9":
+                load_sample_users()
             case "0":
                 print("Exiting the application. Goodbye!")
                 running = False
@@ -457,4 +575,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    login_main()
