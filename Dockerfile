@@ -1,5 +1,3 @@
-# 1. Base Image: Every Dockerfile must start with a FROM command. 
-# We use a stable, lightweight Python image (3.11 is compatible with pandas 2.1.0)
 FROM python:3.11-alpine
 
 # Set the working directory inside the container
@@ -38,6 +36,3 @@ ENV FLASK_RUN_HOST=0.0.0.0
 # This is the final instruction: Run the application using Gunicorn
 # 'app:app' refers to the Flask instance named 'app' inside the file 'app.py'
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
-```eof
-
-Using this complete file should successfully define your build stage and allow Docker to proceed with the rest of the installation steps.
