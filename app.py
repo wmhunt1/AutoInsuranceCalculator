@@ -45,7 +45,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": [
     "http://localhost:3000",
     "https://your-frontend-domain.com",
-    "http://localhost:50949/"
+    "http://localhost:50949"
 ]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
