@@ -3,14 +3,16 @@
 Simple console app for Telematics Risk Modeling.
 
 This script implements a two-tiered CLI: a Login menu to select a user and 
-a Session menu to run feature engineering and prediction for that user's device.
+a Session menu to run feature engineering and premium estimation for that user's device.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Any
 import os
 import sys
 import argparse
 import re
+import time
+import hashlib 
 
 # --- THIRD-PARTY LIBRARIES ---
 import pandas as pd
@@ -21,7 +23,6 @@ from dotenv import load_dotenv
 # --- SKLEARN FOR MODELING ---
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-# import matplotlib.pyplot as plt # Not needed in CLI version
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -31,7 +32,7 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
 RAW_DATA_COLLECTION = "raw_telematics"
 CLAIMS_COLLECTION = "claims_history"
-USERS_COLLECTION = "users" # <--- NEW COLLECTION
+USERS_COLLECTION = "users" 
 
 # --- CONSTANTS ---
 DEVICE_COL_CANDIDATES = [
@@ -46,6 +47,25 @@ VALUE_COL_CANDIDATES = [
 CLAIMS_FILE_NAME = "Claims_History.csv"
 FEATURES_FILE_NAME = "Telematics_Risk_Features_FULL.csv"
 
+
+# --- AUTHENTICATION FUNCTIONS ---
+
+def hash_password(password: str, salt: str = "secure_salt") -> str:
+    """
+    Simulates secure password hashing using SHA256 (for simplicity).
+    In a real app, use bcrypt or Argon2.
+    """
+    # Using SHA256 for a secure one-way hash simulation
+    pw_bytes = password.encode('utf-8')
+    salt_bytes = salt.encode('utf-8')
+    hashed = hashlib.sha256(pw_bytes + salt_bytes).hexdigest()
+    return hashed
+
+def verify_password(stored_hash: str, provided_password: str, salt: str = "secure_salt") -> bool:
+    """
+    Verifies a provided password against a stored hash.
+    """
+    return stored_hash == hash_password(provided_password, salt)
 
 # --- UTILITY FUNCTIONS ---
 
@@ -177,7 +197,6 @@ def display_data(df: pd.DataFrame, device_col: str | None) -> None:
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """
     Calculates the great-circle distance (in km) between two latitude/longitude points.
-    This function is now designed to take Pandas Series or NumPy arrays (vectorized).
     """
     # Convert degrees to radians
     lat1_rad = np.radians(lat1)
@@ -194,23 +213,35 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     return R * c
 
 
-# --- NEW USER MANAGEMENT FUNCTIONS ---
+# --- MONGODB CONNECTION AND USER MANAGEMENT (UNCHANGED) ---
 
 def get_mongo_client():
     """Returns a connected MongoClient using the URI."""
     return MongoClient(MONGO_URI)
 
 def load_sample_users():
-    """Defines and loads sample user data into the MongoDB users collection."""
+    """Defines and loads sample user data into the MongoDB users collection, including hashed passwords."""
     print("\n--- Loading Sample User Data ---")
     
-    # NOTE: You must replace the device_id below with real IDs from your Telematicsdata.csv 
-    # if you want to test with real data.
-    sample_users = [
-        {"user_id": "user_one_id", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
-        {"user_id": "user_two_id", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
-        {"user_id": "user_three_id", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
+    # Store plain passwords in a dict for hashing before saving
+    user_passwords = {
+        "alice_smith": "Password123",
+        "bob_johnson": "SecurePass456",
+        "charlie_brown": "TestUser789",
+    }
+    
+    # NOTE: These device_ids are derived from your Telematicsdata.csv
+    sample_users_data = [
+        {"user_id": "user_one_id", "username": "alice_smith", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
+        {"user_id": "user_two_id", "username": "bob_johnson", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
+        {"user_id": "user_three_id", "username": "charlie_brown", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
     ]
+
+    # HASH THE PASSWORDS and add them to the data
+    for user in sample_users_data:
+        plain_pw = user_passwords[user['username']]
+        user['hashed_password'] = hash_password(plain_pw)
+        
     try:
         with get_mongo_client() as client:
             db = client[DATABASE_NAME]
@@ -218,38 +249,42 @@ def load_sample_users():
             
             # Clear existing data and insert new data
             collection.delete_many({})
-            result = collection.insert_many(sample_users)
+            result = collection.insert_many(sample_users_data)
             
-            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}'.")
-            print("--- Sample Users Loaded ---")
-            for i, user in enumerate(sample_users):
-                print(f"[{i+1}] {user['name']} (Device: {user['device_id']})")
+            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}' with hashed passwords.")
+            print("--- Sample Users Loaded (Credentials for testing) ---")
+            for user in sample_users_data:
+                print(f"  - User: {user['username']} | Pass: {user_passwords[user['username']]} | Device: {user['device_id']}")
                 
     except Exception as e:
         print(f"❌ Failed to load sample users. Error: {e}")
 
-def get_user_by_selection(choice: str):
-    """Fetches a user document from MongoDB based on the numeric menu choice."""
+def get_user_by_credentials(username: str, password: str):
+    """Fetches a user document from MongoDB and verifies the password."""
     try:
         with get_mongo_client() as client:
             db = client[DATABASE_NAME]
             collection = db[USERS_COLLECTION]
             
-            # Find the user based on the selected index
-            users_list = list(collection.find({}))
-            index = int(choice) - 1
+            # 1. Find user by username
+            user_data = collection.find_one({"username": username})
             
-            if 0 <= index < len(users_list):
-                return users_list[index]
+            if user_data:
+                # 2. Verify password against stored hash
+                if verify_password(user_data['hashed_password'], password):
+                    return user_data
+                else:
+                    print("Login failed: Invalid password.")
+                    return None
             else:
-                print("Invalid user selection.")
+                print(f"Login failed: User '{username}' not found.")
                 return None
                 
     except Exception as e:
-        print(f"❌ Error fetching user data. Did you run the migration/load users? Error: {e}")
+        print(f"❌ Error fetching user data from MongoDB: {e}")
         return None
 
-# --- MONGODB MIGRATION LOGIC ---
+# --- MONGODB MIGRATION LOGIC (UNCHANGED) ---
 
 def migrate_csv_to_mongodb(csv_file_path: str, collection_name: str, client: MongoClient):
     """Loads a CSV file and inserts its records into the specified MongoDB collection."""
@@ -283,7 +318,7 @@ def run_migration():
     except Exception as e:
         print(f"🚨 FAILED to connect to MongoDB. Error: {e}")
 
-# --- CORE FEATURE ENGINEERING (Updated to accept device_id) ---
+# --- CORE FEATURE ENGINEERING (UNCHANGED) ---
 
 def calculate_all_features(device_id: Optional[str]):
     """
@@ -308,7 +343,6 @@ def calculate_all_features(device_id: Optional[str]):
     # Check if any POSITION data exists for the filtered device(s)
     if position_df.empty:
         print(f"Warning: No 'POSITION' data found for device {mode}. Cannot calculate movement features.")
-        # If running for a single device, display placeholder features
         if device_id:
             final_risk_features = pd.DataFrame({
                 'deviceId': [device_id], 
@@ -351,18 +385,15 @@ def calculate_all_features(device_id: Optional[str]):
     
     grouped = position_df.groupby('deviceId')
 
-    # --- FIX APPLIED: Create Lagged Columns first, then calculate vectorially ---
+    # Create Lagged Columns first, then calculate distance vectorially
     print("-> Calculating distance using grouped lagged coordinates...")
-    # 1. Create lagged columns using groupby().shift(1)
     position_df.loc[:, 'latitude_prev'] = grouped['latitude'].shift(1)
     position_df.loc[:, 'longitude_prev'] = grouped['longitude'].shift(1)
     
-    # 2. Calculate distance vectorially across the entire dataframe
     position_df.loc[:, 'distance_km'] = haversine_distance(
         position_df['latitude_prev'], position_df['longitude_prev'],
         position_df['latitude'], position_df['longitude']
     )
-    # --------------------------------------------------------------------------
     
     position_df['time_diff_sec'] = grouped['time_sec'].diff() 
     position_df['speed_kmh'] = np.where(
@@ -423,82 +454,140 @@ def calculate_all_features(device_id: Optional[str]):
     final_risk_features = pd.merge(grouped_features, speed_risk_df[['deviceId', 'percent_time_high_speed']], on='deviceId', how='left')
     
     if device_id:
-        print(f"\n✅ Features for Device {device_id} Calculated:")
-        # Display only the features for the single device
-        print(final_risk_features.head(1).to_string(index=False))
-        # Do not save to file when running for a single user session
+        print(f"\n✅ Features for Device {device_id} Calculated.")
+        pass
     else:
         # Only save the full file if we processed ALL devices (Batch Mode)
         final_risk_features.to_csv(FEATURES_FILE_NAME, index=False)
         print(f"\nSuccessfully generated {len(final_risk_features)} device features.")
         print(f"Final feature table saved to: {FEATURES_FILE_NAME}")
 
+    return final_risk_features
 
-# --- CORE PREDICTION (Updated to accept device_id) ---
+# --- SIMULATION FUNCTION (External API) ---
 
-def calculate_insurance_rate(device_id: str):
+def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     """
-    Calculates Insurance Rate by training a model on the batch feature file
-    and predicting the risk score for the specified single device.
+    Simulates calling an external insurance API to get a premium estimate.
+    """
+    # 1. Simulate proprietary risk mapping (Example Logic)
+    hard_brake_score = np.interp(
+        features['hard_brake_rate_per_1000km'],
+        [0, 5, 10, 20],  # Input range (your feature value)
+        [1, 3, 6, 10]    # Output range (the API's required risk score 1-10)
+    )
+    
+    high_speed_score = np.interp(
+        features['percent_time_high_speed'],
+        [0, 2, 5, 10],   # Input range (your feature value: percent)
+        [1, 3, 6, 10]    # Output range (the API's required risk score 1-10)
+    )
+
+    avg_risk_score = (hard_brake_score + high_speed_score) / 2
+    
+    # 2. Simulate Premium Calculation (Example Logic)
+    base_premium = 1100.0 # Slightly adjusted base for difference from internal model
+    adjustment_factor = (avg_risk_score / 10.0) * 0.7 
+    premium = base_premium * (1 + adjustment_factor)
+    
+    # 3. Simulate API Call Details and Response
+    print("\n--- 🌐 Simulating External Insurance API Call ---")
+    print(f"   -> Mapping internal features for Device {features['deviceId']}...")
+    print(f"      - Hard Brake Score Sent to API: {hard_brake_score:.1f}/10")
+    print(f"      - High Speed Score Sent to API: {high_speed_score:.1f}/10")
+    print(f"   -> Sending Simulated POST Request to /v1/quote...")
+    
+    time.sleep(0.5) # Simulate latency
+    
+    # 4. Determine Quote Message
+    if premium > 1550:
+        quote_message = "External Vendor - High Risk Quote."
+    elif premium > 1250:
+        quote_message = "External Vendor - Standard Quote."
+    else:
+        quote_message = "External Vendor - Best Rate."
+        
+    print("   <- Received Simulated 200 OK Response.")
+
+    return premium, quote_message
+
+# --- CORE PREMIUM ESTIMATION (UPDATED FOR BOTH INTERNAL/EXTERNAL) ---
+
+def get_and_display_all_estimates(device_id: str):
+    """
+    Calculates the internal risk score/premium and calls the simulated external API.
     """
     
-    print(f"\n--- [4] Calculate Insurance Rate (Predicting Risk Score) for Device: {device_id} ---")
-    
-    # Check dependencies (requires features and claims files for model training)
+    print(f"\n--- [2] Generating Internal and External Premium Estimates for Device: {device_id} ---")
+
+    # 1. Check dependencies
     if not os.path.exists(FEATURES_FILE_NAME) or not os.path.exists(CLAIMS_FILE_NAME):
         print(f"Error: Required feature or claims files not found.")
-        print("Please run **[4] Calculate ALL Features and SAVE (Batch Mode)** first to train the model.")
+        print("Please run **[4] Calculate ALL Features and SAVE (Batch Mode)** first to ensure the training data is ready.")
         return
 
-    # 1. LOAD DATA (Full dataset for training, target features for prediction)
+    # 2. Load and Prepare Data for Internal Model
     final_risk_features = pd.read_csv(FEATURES_FILE_NAME)
     claims_data = pd.read_csv(CLAIMS_FILE_NAME)
 
-    # Filter feature set down to the target device
-    target_features = final_risk_features[final_risk_features['deviceId'].astype(str) == str(device_id)].copy()
-    if target_features.empty:
-        print(f"Error: No features found in {FEATURES_FILE_NAME} for device ID: {device_id}")
-        print("Did you run [4] Calculate ALL Features after adding your device's data?")
+    target_features_df = final_risk_features[final_risk_features['deviceId'].astype(str) == str(device_id)].copy()
+    
+    if target_features_df.empty:
+        print(f"Error: No features found in {FEATURES_FILE_NAME} for device ID: {device_id}. Cannot provide an estimate.")
         return
 
-    # --- MODEL PREPARATION & TRAINING (Using full dataset for training) ---
-    features = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
+    target_features = target_features_df.iloc[0]
+    
+    features_cols = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
     full_model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
     full_y = full_model_data['has_claim'].fillna(0).astype(int)
     
     if full_y.nunique() <= 1:
-        print("Warning: Target variable 'has_claim' is constant across all data. Skipping prediction.")
-        return
+        print("Warning: Target variable 'has_claim' is constant across all data. Internal prediction skipped.")
+        internal_risk_score = 0.5 # Neutral score fallback
+        internal_premium = 1000.0 # Neutral premium fallback
+    else:
+        # 3. Train and Predict Internal Risk Score (Logistic Regression)
+        print("-> Training Logistic Regression Model on full batch data for Internal Estimate...")
+        X_train, _, y_train, _ = train_test_split(full_model_data[features_cols], full_y, test_size=0.01, random_state=42)
+        
+        model = LogisticRegression(random_state=42, solver='liblinear')
+        model.fit(X_train, y_train)
 
-    print("-> Training Logistic Regression Model on full batch data...")
-    X_train, _, y_train, _ = train_test_split(full_model_data[features], full_y, test_size=0.01, random_state=42)
-    
-    model = LogisticRegression(random_state=42, solver='liblinear')
-    model.fit(X_train, y_train)
+        # Predict Risk Probability (Score)
+        X_predict = target_features_df[features_cols]
+        internal_risk_score = model.predict_proba(X_predict)[:, 1][0]
+        
+        # 4. Calculate Internal Premium
+        BASE_PREMIUM = 1000.0
+        RISK_MULTIPLIER = 1.0 # Max 100% premium uplift at a score of 1.0
+        internal_premium = BASE_PREMIUM * (1 + internal_risk_score * RISK_MULTIPLIER)
 
-    # 2. Predict Risk Probability (Score)
-    X_predict = target_features[features]
-    risk_probabilities = model.predict_proba(X_predict)[:, 1]
+    # 5. CALL THE SIMULATED EXTERNAL API 
+    external_premium, external_message = get_simulated_premium(target_features)
     
-    target_features['risk_score'] = risk_probabilities
-    
-    # 3. Apply a Risk Tier based on the predicted probability
-    HIGH_RISK_PROBABILITY_THRESHOLD = 0.55
-    target_features['final_rate'] = np.where(
-        target_features['risk_score'] >= HIGH_RISK_PROBABILITY_THRESHOLD, 
-        'High Premium (Predicted Risk)', 
-        'Standard Premium'
-    )
-    
-    print("\n-> Prediction Summary ---")
-    print(target_features[[
-        'deviceId', 'hard_brake_rate_per_1000km', 
-        'percent_time_high_speed', 'risk_score', 'final_rate'
-    ]].to_string(index=False))
-    print("\nPrediction complete. The 'risk_score' is the predicted probability of a claim.")
+    # 6. Display Results
+    print("\n=============================================")
+    print("      *** FINAL PREMIUM ESTIMATES ***")
+    print("=============================================")
+    print(f"Device ID: {device_id}")
+    print(f"Driving Exposure (Distance): {target_features['total_distance_km']:.0f} km")
+    print("---------------------------------------------")
+
+    # Internal Estimate
+    print("1. INTERNAL MODEL ESTIMATE")
+    print(f"   - Predicted Claim Risk Score: {internal_risk_score:.4f}")
+    print(f"   - Estimated Annual Premium: ${internal_premium:,.2f}")
+    print("---------------------------------------------")
+
+    # External Estimate
+    print("2. EXTERNAL VENDOR ESTIMATE (Simulated API)")
+    print(f"   - Estimated Annual Premium: ${external_premium:,.2f}")
+    print(f"   - Vendor Quote Message: {external_message}")
+    print("=============================================")
 
 
-# --- CLI EXECUTION LOOPS ---
+# --- CLI EXECUTION LOOPS (UPDATED MENU TEXT) ---
 
 def session_main(user_data):
     """The main CLI loop run after a user has logged in."""
@@ -514,7 +603,7 @@ def session_main(user_data):
         print(f" 👤 Session Menu for: {user_name}")
         print("=======================================")
         print("[1] Calculate Features for MY Device (Real-Time)")
-        print("[2] Predict Insurance Rate for MY Device (Model Score)")
+        print("[2] **Generate ALL Premium Estimates (Internal & External)** 💰")
         print("---------------------------------------")
         print("[4] Calculate ALL Features and SAVE (Batch Mode - Required for [2])")
         print("[9] Display Test Data (Raw POSITION rows for ALL devices)")
@@ -525,7 +614,7 @@ def session_main(user_data):
             case "1":
                 calculate_all_features(device_id)
             case "2":
-                calculate_insurance_rate(device_id)
+                get_and_display_all_estimates(device_id)
             case "4":
                 # Original batch mode (no device ID) - runs on all data
                 calculate_all_features(device_id=None)
@@ -546,20 +635,21 @@ def login_main():
         print("\n=======================================")
         print(" 💻 Telematics Risk Model: LOGIN/SETUP")
         print("=======================================")
-        print("Select User to Log In:")
-        print("[1] User One (Alice Smith)")
-        print("[2] User Two (Bob Johnson)")
-        print("[3] User Three (Charlie Brown)")
+        print("Select Action:")
+        print("[L] Login to Account")
         print("---------------------------------------")
         print("[8] Run MongoDB CSV Migration 🚀 (One-Time)")
         print("[9] Load Sample Users 🧑‍💻 (One-Time)")
         print("[0] Quit Application")
         
-        choice = input("Selection: ").strip()
+        choice = input("Selection: ").strip().lower()
 
         match choice:
-            case "1" | "2" | "3":
-                user_data = get_user_by_selection(choice)
+            case "l":
+                username = input("Enter Username: ").strip().lower()
+                # Security Best Practice: Use getpass.getpass() in a real app
+                password = input("Enter Password: ").strip() 
+                user_data = get_user_by_credentials(username, password)
                 if user_data:
                     # Pass control to the session menu
                     session_main(user_data)
