@@ -42,10 +42,7 @@ app = Flask(__name__)
 # --- CRITICAL STEP: CONFIGURE CORS ---
 # You must update this with your actual GitHub Pages URL later for security.
 # For now, we allow all origins ('*') for easy testing, but restrict methods.
-CORS(app, resources={r"/*": {"origins": [
-    "http://localhost"
-    "https://your-frontend-domain.com",
-]}})
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
 # NOTE: The default here is for local testing. In Railway, this MUST be overridden
@@ -75,6 +72,36 @@ def hash_password(password: str, salt: str = "secure_salt") -> str:
 def verify_password(stored_hash: str, provided_password: str, salt: str = "secure_salt") -> bool:
     """Verifies a provided password against a stored hash."""
     return stored_hash == hash_password(provided_password, salt)
+
+def create_new_user(username: str, password: str, name: str, source_device_id: str, device_id: str):
+    """Creates a new user in MongoDB with initial data."""
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[USERS_COLLECTION]
+            
+            # Check if user already exists
+            if collection.find_one({"username": username}):
+                return {"error": "Username already exists."}, None
+            
+            # Create a new document
+            user_doc = {
+                "username": username,
+                "name": name,
+                "hashed_password": hash_password(password),
+                "device_id": device_id,
+                "source_device_id": source_device_id, # Source ID for telematics data
+                "created_at": time.time()
+            }
+            
+            result = collection.insert_one(user_doc)
+            user_doc['_id'] = str(result.inserted_id)
+            del user_doc['hashed_password']
+            return None, user_doc
+            
+    except Exception as e:
+        print(f"❌ Error creating user in MongoDB: {e}")
+        return {"error": f"Database error during creation: {e}"}, None
 
 def get_user_by_credentials(username: str, password: str):
     """Fetches a user document from MongoDB and verifies the password."""
@@ -343,6 +370,34 @@ def login_route():
     else:
         return jsonify({"error": "Invalid username or password"}), 401
 
+@app.route('/create_user', methods=['POST'])
+def create_user_route():
+    """Handles new user creation."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No input data provided"}), 400
+        
+    username = data.get('username')
+    password = data.get('password')
+    name = data.get('name', username)
+    # New users default to their own device_id as source_device_id
+    device_id = data.get('device_id', 'NEW_USER_' + ''.join(random.choices(string.digits, k=5)))
+    source_device_id = data.get('source_device_id', 'driver1') # Default new users to existing data source for estimate demo
+
+    if not all([username, password]):
+        return jsonify({"error": "Username and password are required."}), 400
+
+    error, new_user = create_new_user(username, password, name, source_device_id, device_id)
+    
+    if error:
+        return jsonify(error), 409 # 409 Conflict if username exists
+    else:
+        return jsonify({
+            "message": "User created and logged in successfully",
+            "user": new_user
+        }), 201
+        
+        
 @app.route('/features', methods=['POST'])
 def get_features_route():
     """Calculates and returns the user's latest telematics features."""
