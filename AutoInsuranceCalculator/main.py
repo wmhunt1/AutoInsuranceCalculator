@@ -165,44 +165,6 @@ def load_sample_users():
     except Exception:
         print("Warning: Claims file not available. Cannot set initial claim status for sample users.")
 
-    # Store plain passwords in a dict for hashing before saving
-    user_passwords = {
-        "alice_smith": "Password123",
-        "bob_johnson": "SecurePass456",
-        "charlie_brown": "TestUser789",
-    }
-    
-    # NOTE: These device_ids are derived from your Telematicsdata.csv
-    sample_users_data = [
-        {"user_id": "user_one_id", "username": "alice_smith", "name": "Alice Smith", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAtwB1gBAQ"},
-        {"user_id": "user_two_id", "username": "bob_johnson", "name": "Bob Johnson", "device_id": "zRYzhAEAHAABAAAKCRtcAAsANAB0gBAQ"},
-        {"user_id": "user_three_id", "username": "charlie_brown", "name": "Charlie Brown", "device_id": "zRYzhAEAHAABAAAKCRtcAAsAGAB0gBAQ"},
-    ]
-
-    # HASH THE PASSWORDS and add them to the data, along with their actual claim status
-    for user in sample_users_data:
-        plain_pw = user_passwords[user['username']]
-        user['hashed_password'] = hash_password(plain_pw)
-        user['source_device_id'] = user['device_id'] # Old users use their own device ID as source
-        user['has_claim'] = claims_map.get(user['device_id'], 0) # Fetch claim status, default to 0
-        
-    try:
-        with get_mongo_client() as client:
-            db = client[DATABASE_NAME]
-            collection = db[USERS_COLLECTION]
-            
-            # Clear existing data and insert new data
-            collection.delete_many({})
-            result = collection.insert_many(sample_users_data)
-            
-            print(f"✅ Successfully loaded {len(result.inserted_ids)} sample users into '{USERS_COLLECTION}' with hashed passwords.")
-            print("--- Sample Users Loaded (Credentials for testing) ---")
-            for user in sample_users_data:
-                print(f"  - User: {user['username']} | Pass: {user_passwords[user['username']]} | Claim: {user['has_claim']}")
-                
-    except Exception as e:
-        print(f"❌ Failed to load sample users. Error: {e}")
-
 def get_user_by_credentials(username: str, password: str):
     """Fetches a user document from MongoDB and verifies the password."""
     try:
