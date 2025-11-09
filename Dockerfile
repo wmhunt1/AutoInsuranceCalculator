@@ -1,38 +1,32 @@
-FROM python:3.11-alpine
+# We start with the official Python image
+FROM python:3.11-slim
 
 # Set the working directory inside the container
 WORKDIR /usr/src/app
 
-# 2. Install Build Dependencies: These are critical for compiling binary packages (like pandas/numpy)
-# 'apk add' installs tools like gcc (C compiler) and musl-dev (C library headers)
-RUN apk add --no-cache gcc g++ musl-dev openblas-dev gfortran
+# --- FIX: Install System Dependencies for Compilation ---
+# These packages provide the necessary C/C++ compilers and linear algebra libraries 
+# (BLAS/LAPACK) that scikit-learn, numpy, and pandas require to build from source.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libatlas-base-dev \
+    && rm -rf /var/lib/apt/lists/*
+# --- END FIX ---
 
-# 3. Copy and Install Python Dependencies
-# Copy requirements first to leverage Docker's layer caching
-COPY requirements.txt .
+# Copy the requirements file into the working directory
+COPY requirements.txt ./
 
-# Install all Python packages specified in requirements.txt
+# Install the Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Cleanup Build Dependencies
-# Remove the heavy build tools to minimize the final container image size
-RUN apk del gcc musl-dev
-
-# 5. Copy Application Code and Data Files
-# Copy the rest of the current directory content into the container
+# Copy the rest of the application code
 COPY . .
 
-# 6. Expose Port
-# Inform Docker that the container will listen on this port
+# Expose the port your Flask application runs on
 EXPOSE 5000
 
-# 7. Define Environment Variables
-# Essential for running Flask/Gunicorn
-ENV FLASK_APP=app.py
-# Set host to 0.0.0.0 to make the service accessible outside the container
-ENV FLASK_RUN_HOST=0.0.0.0
-
-# 8. Production Command (CMD)
-# This is the final instruction: Run the application using Gunicorn
-# 'app:app' refers to the Flask instance named 'app' inside the file 'app.py'
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+# Define the production command using Gunicorn
+# Adjust 'app:app' if your Flask app instance is named differently or in a different file
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
