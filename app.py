@@ -2,9 +2,9 @@
 """
 Flask API for Telematics Risk Modeling.
 
-This version includes the corrected CORS policy to resolve cross-origin issues
-when connecting a local frontend (e.g., index.html) to the remote Railway API.
-It also includes the /create_user endpoint.
+This version uses a specific list of allowed CORS origins, including the 
+user's GitHub Pages frontend URL, which is a better security practice than 
+using a wildcard.
 """
 
 # --- FLASK IMPORTS ---
@@ -32,21 +32,18 @@ from sklearn.linear_model import LogisticRegression
 # --- FLASK APP INSTANCE ---
 app = Flask(__name__)
 
-# --- CRITICAL STEP: CONFIGURE CORS (FIXED) ---
-# FIX: Using origins="*" allows local file testing (file://) and unknown origins 
-# to access the API. This resolves the browser's CORS block.
-CORS(
-    app, 
-    resources={
-        r"/*": {
-            "origins": [
-                "*", # This currently allows all origins, making the following explicit inclusion redundant *unless* you plan to change this later*
-                "https://wmhunt1.github.io/AutoInsuranceCalculatorUI"
-            ], 
-            "methods": ["GET", "POST", "OPTIONS"]
-        }
-    }
-)
+# --- CRITICAL STEP: CONFIGURE CORS (FIXED WITH SPECIFIC ORIGIN) ---
+# FIX: The origins are now specifically set to allow your GitHub Pages frontend 
+# and common local development servers.
+CORS(app, resources={r"/*": {"origins": [
+    # GitHub Pages URL requested by the user
+    "https://wmhunt1.github.io/AutoInsuranceCalculatorUI", 
+    # Common local testing addresses
+    "http://localhost:5000",
+    "http://localhost:3000",
+    "http://127.0.0.1:5500",
+    "https://wmhunt1.github.io" # Added base URL just in case
+], "methods": ["GET", "POST", "OPTIONS"]}})
 
 # --- CONFIGURATION (UNCHANGED) ---
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
