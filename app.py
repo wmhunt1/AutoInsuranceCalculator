@@ -2,9 +2,9 @@
 """
 Flask API for Telematics Risk Modeling.
 
-This version uses a specific list of allowed CORS origins, including the 
-user's GitHub Pages frontend URL, which is a better security practice than 
-using a wildcard.
+This version has been updated to load ALL necessary data (claims, features, 
+and raw telematics data) from MongoDB collections instead of local CSV files, 
+resolving deployment issues related to missing local files.
 """
 
 # --- FLASK IMPORTS ---
@@ -33,24 +33,23 @@ from sklearn.linear_model import LogisticRegression
 app = Flask(__name__)
 
 # --- CRITICAL STEP: CONFIGURE CORS (FIXED WITH SPECIFIC ORIGIN) ---
-# FIX: The origins are now specifically set to allow your GitHub Pages frontend 
-# and common local development servers.
 CORS(app, resources={r"/*": {"origins": [
-    # GitHub Pages URL requested by the user
     "https://wmhunt1.github.io/AutoInsuranceCalculatorUI", 
-    # Common local testing addresses
     "http://localhost:5000",
     "http://localhost:3000",
     "http://127.0.0.1:5500",
-    "https://wmhunt1.github.io" # Added base URL just in case
+    "https://wmhunt1.github.io" 
 ], "methods": ["GET", "POST", "OPTIONS"]}})
 
-# --- CONFIGURATION (UNCHANGED) ---
+# --- CONFIGURATION (UPDATED TO USE COLLECTIONS) ---
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "telematics_risk_db"
 USERS_COLLECTION = "users" 
-CLAIMS_FILE_NAME = "Claims_History.csv"
-FEATURES_FILE_NAME = "Telematics_Risk_Features_FULL.csv"
+
+# Collections storing the modeling data
+TELEMATICS_COLLECTION = "TelematicsData" 
+CLAIMS_COLLECTION = "ClaimsHistory" 
+FEATURES_COLLECTION = "RiskFeaturesFull"
 
 # --- UTILITY AND CORE LOGIC FUNCTIONS ---
 
@@ -58,6 +57,36 @@ def get_mongo_client():
     """Returns a connected MongoClient using the URI."""
     return MongoClient(MONGO_URI)
 
+def load_mongo_collection_to_df(collection_name: str) -> Optional[pd.DataFrame]:
+    """
+    Loads all documents from a specified MongoDB collection into a pandas DataFrame.
+    """
+    try:
+        with get_mongo_client() as client:
+            db = client[DATABASE_NAME]
+            collection = db[collection_name]
+            
+            # Fetch all documents and convert to a list
+            cursor = collection.find({})
+            data = list(cursor)
+            
+            if not data:
+                print(f"Error: MongoDB collection '{collection_name}' is empty or not found.")
+                return None
+            
+            # Convert list of dictionaries to DataFrame
+            df = pd.DataFrame(data)
+            
+            # Drop the MongoDB internal ID column if it exists
+            if '_id' in df.columns:
+                df.drop(columns=['_id'], inplace=True)
+                
+            return df
+            
+    except Exception as e:
+        print(f"❌ Error loading data from MongoDB collection '{collection_name}': {e}")
+        return None
+        
 def hash_password(password: str, salt: str = "secure_salt") -> str:
     """Simulates secure password hashing."""
     pw_bytes = password.encode('utf-8')
@@ -115,19 +144,6 @@ def create_new_user(username: str, password: str, name: str, source_device_id: s
         print(f"❌ Error creating user in MongoDB: {e}")
         return {"error": f"Database error during creation: {e}"}, None
 
-
-def load_csv(path: str) -> Optional[pd.DataFrame]:
-    """Loads the CSV file and handles errors, returns None on failure."""
-    if not os.path.exists(path):
-        print(f"Error: file not found: {path}")
-        return None
-    try:
-        df = pd.read_csv(path)
-        return df
-    except Exception as ex:
-        print(f"Error reading CSV: {ex}")
-        return None
-
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """Calculates the great-circle distance (in km) between two latitude/longitude points."""
     lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
@@ -140,12 +156,18 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
 def calculate_all_features(device_id: Optional[str], source_device_id: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
     Performs the full feature engineering pipeline.
-    Returns the resulting features DataFrame or None on error.
+    Now loads raw data from the TelematicsData MongoDB collection.
     """
     filter_id = source_device_id if source_device_id else device_id
-    df = load_csv("Telematicsdata.csv")
+    
+    # --- CHANGE: Load from MongoDB Collection ---
+    df = load_mongo_collection_to_df(TELEMATICS_COLLECTION)
     if df is None: return None
+    # -------------------------------------------
 
+    # Ensure deviceId is treated as string for matching
+    df['deviceId'] = df['deviceId'].astype(str)
+    
     # Filter by the actual data source ID
     if filter_id:
         df = df[df['deviceId'].astype(str) == str(filter_id)].copy()
@@ -259,22 +281,26 @@ def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     return float(premium), quote_message
 
 def get_premium_estimates_for_api(user_data) -> dict:
-    """Core logic to calculate estimates for API response."""
+    """Core logic to calculate estimates for API response. Now loads data from MongoDB."""
     device_id = user_data['device_id']
     source_device_id = user_data.get('source_device_id', device_id)
     name = user_data.get('name', 'User')
     
     # 1. Load Data for Internal Model
-    final_risk_features = load_csv(FEATURES_FILE_NAME)
-    claims_data = load_csv(CLAIMS_FILE_NAME)
+    # --- CHANGE: Load from MongoDB Collections ---
+    final_risk_features = load_mongo_collection_to_df(FEATURES_COLLECTION)
+    claims_data = load_mongo_collection_to_df(CLAIMS_COLLECTION)
+    # ---------------------------------------------
 
     if final_risk_features is None or claims_data is None:
-        return {"error": "Required feature or claims files not found on the server. Please ensure data files are present."}
+        # NOTE: This error now indicates the required MongoDB collection is missing or empty.
+        return {"error": "Required feature or claims data collections not found or empty in MongoDB. Please ensure data is loaded."}
 
     # Filter features based on the data source ID
     target_features_df = final_risk_features[final_risk_features['deviceId'].astype(str) == str(source_device_id)].copy()
     
     if target_features_df.empty:
+        # Fallback: Calculate features in real-time from raw telematics data (also now loaded from Mongo)
         target_features_df = calculate_all_features(device_id=device_id, source_device_id=source_device_id)
         if target_features_df is None or target_features_df.empty:
             return {"error": "Could not generate real-time features. Cannot provide an estimate."}
@@ -282,6 +308,11 @@ def get_premium_estimates_for_api(user_data) -> dict:
     target_features = target_features_df.iloc[0]
     
     features_cols = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
+    
+    # Ensure deviceId columns are of type string for merging
+    final_risk_features['deviceId'] = final_risk_features['deviceId'].astype(str)
+    claims_data['deviceId'] = claims_data['deviceId'].astype(str)
+    
     full_model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
     full_y = full_model_data['has_claim'].fillna(0).astype(int)
     
