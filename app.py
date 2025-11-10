@@ -2,18 +2,9 @@
 """
 Flask API for Telematics Risk Modeling.
 
-This version has been updated to load ALL necessary data (claims, features, 
-and raw telematics data) from MongoDB collections instead of local CSV files, 
-resolving deployment issues related to missing local files.
-
-CRITICAL UPDATE: The core logic now correctly handles a missing or empty 
-'RiskFeaturesFull' collection by falling back to real-time feature calculation
-from 'TelematicsData', and uses a simplified risk model when the full dataset 
-for training is unavailable.
-
-DEBUGGING UPDATE: Added robust logging and top-level error handling to debug 
-502 Bad Gateway issues, likely caused by large synchronous data loads or 
-connection failures.
+CRITICAL UPDATE: Data loading and model training are now performed once on 
+application startup, caching the results globally for performance and stability. 
+The core estimation logic now uses the cached model or a robust heuristic fallback.
 """
 
 # --- FLASK IMPORTS ---
@@ -27,7 +18,8 @@ import time
 import hashlib 
 import random 
 import string 
-import sys # Added for detailed error logging
+import sys 
+import atexit # Added for cleanup if needed, but primarily for robustness
 
 # --- DATA AND DB LIBRARIES ---
 import pandas as pd
@@ -43,7 +35,7 @@ from sklearn.linear_model import LogisticRegression
 # --- FLASK APP INSTANCE ---
 app = Flask(__name__)
 
-# --- CRITICAL STEP: CONFIGURE CORS (FIXED WITH SPECIFIC ORIGIN) ---
+# --- CRITICAL STEP: CONFIGURE CORS ---
 CORS(app, resources={r"/*": {"origins": [
     "https://wmhunt1.github.io/AutoInsuranceCalculatorUI", 
     "http://localhost:5000",
@@ -62,31 +54,32 @@ TELEMATICS_COLLECTION = "raw_telematics"
 CLAIMS_COLLECTION = "claims_history" 
 FEATURES_COLLECTION = "RiskFeaturesFull"
 
+# --- GLOBAL CACHED DATA AND MODEL (NEW) ---
+TRAINING_FEATURES_DF: Optional[pd.DataFrame] = None # Cached features for training set
+CLAIMS_DF: Optional[pd.DataFrame] = None            # Cached claims data
+RISK_MODEL: Optional[LogisticRegression] = None     # Cached trained model
+DATA_LOAD_STATUS: str = "PENDING"                   # Status of the initial load
+FEATURES_COLS = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
+
 # --- UTILITY AND CORE LOGIC FUNCTIONS ---
 
 def get_mongo_client():
     """Returns a connected MongoClient using the URI."""
-    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) # Added timeout
+    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 
 def load_mongo_collection_to_df(collection_name: str) -> Optional[pd.DataFrame]:
     """
     Loads all documents from a specified MongoDB collection into a pandas DataFrame.
-    Includes enhanced logging for debugging 502 errors.
     """
     start_time = time.time()
     print(f"🔄 Attempting to load collection: '{collection_name}'...")
     
     try:
         with get_mongo_client() as client:
-            # Check connection status immediately
             client.admin.command('ping')
-            print(f"✅ MongoDB Connection successful to {MONGO_URI} / Database: {DATABASE_NAME}.")
-            
             db = client[DATABASE_NAME]
             collection = db[collection_name]
             
-            # Fetch all documents and convert to a list
-            # NOTE: For very large collections, this is a 502 risk.
             cursor = collection.find({})
             data = list(cursor)
             
@@ -107,14 +100,14 @@ def load_mongo_collection_to_df(collection_name: str) -> Optional[pd.DataFrame]:
         print(f"❌ CRITICAL CONNECTION FAILURE (Check MONGO_URI): {e}", file=sys.stderr)
         return None
     except OperationFailure as e:
-        # e.g., Authentication failure, Database not found
         print(f"❌ MONGODB OPERATION ERROR (Check DB Name/Permissions): {e}", file=sys.stderr)
         return None
     except Exception as e:
-        # Catchall for non-existent collection, memory error, pandas error, etc.
         print(f"❌ General Error loading data from MongoDB collection '{collection_name}': {e}", file=sys.stderr)
         return None
         
+# --- USER MANAGEMENT FUNCTIONS (Unchanged, included for completeness) ---
+
 def hash_password(password: str, salt: str = "secure_salt") -> str:
     """Simulates secure password hashing."""
     pw_bytes = password.encode('utf-8')
@@ -149,11 +142,9 @@ def create_new_user(username: str, password: str, name: str, source_device_id: s
             db = client[DATABASE_NAME]
             collection = db[USERS_COLLECTION]
             
-            # Check if user already exists
             if collection.find_one({"username": username}):
                 return {"error": "Username already exists."}, None
             
-            # Create a new document
             user_doc = {
                 "username": username,
                 "name": name,
@@ -172,6 +163,8 @@ def create_new_user(username: str, password: str, name: str, source_device_id: s
         print(f"❌ Error creating user in MongoDB: {e}", file=sys.stderr)
         return {"error": f"Database error during creation: {e}"}, None
 
+# --- FEATURE CALCULATION LOGIC (Unchanged, relies on raw telematics load) ---
+
 def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
     """Calculates the great-circle distance (in km) between two latitude/longitude points."""
     lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
@@ -183,22 +176,23 @@ def haversine_distance(lat1, lon1, lat2, lon2, R=6371):
 
 def calculate_all_features(device_id: Optional[str], source_device_id: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
-    Performs the full feature engineering pipeline from raw telematics data.
+    Performs the full feature engineering pipeline from raw telematics data 
+    for a specific device ID (or source ID).
     """
     filter_id = source_device_id if source_device_id else device_id
     
+    # NOTE: This still loads raw data synchronously, which is necessary when features aren't pre-calculated.
     df = load_mongo_collection_to_df(TELEMATICS_COLLECTION)
     if df is None: return None
 
-    # Ensure deviceId is treated as string for matching
     df['deviceId'] = df['deviceId'].astype(str)
     
-    # Filter by the actual data source ID
     if filter_id:
         df = df[df['deviceId'].astype(str) == str(filter_id)].copy()
         if df.empty: return None
             
     position_df = df[df['variable'] == 'POSITION'].copy()
+    
     if position_df.empty: 
         if device_id:
             # Return zero features if no position data is found
@@ -285,6 +279,67 @@ def calculate_all_features(device_id: Optional[str], source_device_id: Optional[
     return final_risk_features[['deviceId', 'total_distance_km', 'hard_brake_rate_per_1000km', 'hard_accel_rate_per_1000km', 'percent_time_high_speed']]
 
 
+# --- STARTUP AND CACHING LOGIC (NEW) ---
+
+def load_and_train_model_on_startup():
+    """
+    Loads necessary static data from MongoDB and trains the risk model once 
+    upon application startup. Caches results globally.
+    """
+    global TRAINING_FEATURES_DF, CLAIMS_DF, RISK_MODEL, DATA_LOAD_STATUS
+    
+    # 1. Load Claims Data (Mandatory)
+    CLAIMS_DF = load_mongo_collection_to_df(CLAIMS_COLLECTION)
+    if CLAIMS_DF is None:
+        DATA_LOAD_STATUS = f"FAILURE: Claims data ('{CLAIMS_COLLECTION}') missing or empty. Cannot run model."
+        print(f"🚨 {DATA_LOAD_STATUS}", file=sys.stderr)
+        return
+
+    CLAIMS_DF['deviceId'] = CLAIMS_DF['deviceId'].astype(str)
+    
+    # 2. Try to Load Pre-calculated Features (Optional for fallback)
+    features_df = load_mongo_collection_to_df(FEATURES_COLLECTION)
+    
+    if features_df is not None and not features_df.empty:
+        features_df['deviceId'] = features_df['deviceId'].astype(str)
+        
+        # Merge features with claims data for training
+        full_model_data = pd.merge(features_df, CLAIMS_DF[['deviceId', 'has_claim']], on='deviceId', how='left')
+        
+        # Fill NaN claims (assuming no claim if not in claims collection)
+        full_y = full_model_data['has_claim'].fillna(0).astype(int)
+        
+        # Check for sufficient data diversity
+        if full_y.nunique() > 1 and len(full_y) > 10:
+            try:
+                # Train model
+                X_train, _, y_train, _ = train_test_split(full_model_data[FEATURES_COLS], full_y, test_size=0.01, random_state=42)
+                
+                RISK_MODEL = LogisticRegression(random_state=42, solver='liblinear')
+                RISK_MODEL.fit(X_train, y_train)
+                
+                TRAINING_FEATURES_DF = features_df
+                DATA_LOAD_STATUS = "SUCCESS: Full model trained and features cached."
+                return
+                
+            except Exception as e:
+                DATA_LOAD_STATUS = f"FAILURE: Model training failed ({e}). Using heuristic fallback."
+                print(f"🚨 Model training failed on startup: {e}", file=sys.stderr)
+        else:
+            DATA_LOAD_STATUS = "SUCCESS: Features loaded but model diversity insufficient. Using heuristic."
+            TRAINING_FEATURES_DF = features_df
+            print("⚠️ Insufficient data diversity for complex model training on startup. Proceeding with heuristic fallback.")
+            
+    else:
+        DATA_LOAD_STATUS = "WARNING: Features collection missing/empty. Using heuristic model and real-time feature calculation."
+        print(f"⚠️ Features collection ('{FEATURES_COLLECTION}') not found or empty. Using heuristic fallback.")
+
+    # If model training failed or features were missing, RISK_MODEL remains None, which triggers the heuristic logic.
+    RISK_MODEL = None
+    TRAINING_FEATURES_DF = features_df 
+
+# --- ESTIMATION LOGIC (Refactored to use cache) ---
+
 def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     """Simulates calling an external insurance API to get a premium estimate."""
     hard_brake_score = np.interp(
@@ -308,68 +363,41 @@ def get_simulated_premium(features: pd.Series) -> tuple[float, str]:
     return float(premium), quote_message
 
 def get_premium_estimates_for_api(user_data) -> dict:
-    """Core logic to calculate estimates for API response. Now loads data from MongoDB."""
+    """
+    Core logic to calculate estimates for API response using cached data/model.
+    This function no longer performs heavy synchronous data loading or model training.
+    """
     device_id = user_data['device_id']
     source_device_id = user_data.get('source_device_id', device_id)
     name = user_data.get('name', 'User')
-    
-    # 1. Load ESSENTIAL Data (Claims History is mandatory)
-    claims_data = load_mongo_collection_to_df(CLAIMS_COLLECTION)
-    if claims_data is None:
-        return {"error": f"Required Claims History data collection ('{CLAIMS_COLLECTION}') not found or empty in MongoDB. Cannot run model."}
-    
-    # 2. Try to Load Pre-calculated Features (Primary Source - Optional)
-    # The FEATURES_COLLECTION constant is still used for the *attempt* to load pre-calculated data.
-    final_risk_features = load_mongo_collection_to_df(FEATURES_COLLECTION)
+
+    # 1. Get Target Features: Check cache first, otherwise calculate in real-time
     target_features_df = pd.DataFrame() 
-
-    # --- Step 2a: Check if pre-calculated features are available ---
-    if final_risk_features is not None:
-        # Features collection exists, try to find the specific device in it.
-        final_risk_features['deviceId'] = final_risk_features['deviceId'].astype(str)
-        target_features_df = final_risk_features[
-            final_risk_features['deviceId'] == str(source_device_id)
+    
+    if TRAINING_FEATURES_DF is not None:
+        # Check cached training features for the target device (uses source_device_id)
+        target_features_df = TRAINING_FEATURES_DF[
+            TRAINING_FEATURES_DF['deviceId'] == str(source_device_id)
         ].copy()
-        
-        if not target_features_df.empty:
-            print(f"✅ Found pre-calculated features for {source_device_id}. Using primary source.")
 
-    # --- Step 2b: Fallback to real-time calculation if primary data is missing/empty ---
     if target_features_df.empty:
-        print(f"⚠️ Pre-calculated features missing or collection '{FEATURES_COLLECTION}' is unavailable. Falling back to real-time calculation.")
-        
+        # Fallback: Calculate real-time features from raw telematics
+        print(f"⚙️ Calculating real-time features for {source_device_id}...")
         target_features_df = calculate_all_features(device_id=device_id, source_device_id=source_device_id)
         
         if target_features_df is None or target_features_df.empty:
             return {"error": "Failed to generate features. Raw Telematics Data may be missing or the device ID is not present."}
-    
-    # 3. Internal Model Training and Prediction
+
     target_features = target_features_df.iloc[0]
-    features_cols = ['hard_brake_rate_per_1000km', 'percent_time_high_speed', 'total_distance_km']
     
-    if final_risk_features is not None:
-        # The full dataset exists, we can train the logistic regression model properly
-        final_risk_features['deviceId'] = final_risk_features['deviceId'].astype(str)
-        claims_data['deviceId'] = claims_data['deviceId'].astype(str)
-        
-        # Merge features with claims data for training
-        full_model_data = pd.merge(final_risk_features, claims_data[['deviceId', 'has_claim']], on='deviceId', how='left')
-        full_y = full_model_data['has_claim'].fillna(0).astype(int)
-        
-        if full_y.nunique() > 1 and len(full_y) > 10:
-            # Train model
-            X_train, _, y_train, _ = train_test_split(full_model_data[features_cols], full_y, test_size=0.01, random_state=42)
-            model = LogisticRegression(random_state=42, solver='liblinear')
-            model.fit(X_train, y_train)
-            X_predict = target_features_df[features_cols] 
-            internal_risk_score = model.predict_proba(X_predict)[:, 1][0]
-        else:
-            print("⚠️ Insufficient data diversity for complex model training, using simplified score.")
-            internal_risk_score = 0.5 
+    # 2. Internal Model Prediction
+    if RISK_MODEL is not None:
+        # Use the cached Logistic Regression Model
+        X_predict = target_features_df[FEATURES_COLS] 
+        internal_risk_score = RISK_MODEL.predict_proba(X_predict)[:, 1][0]
+        model_source = "LogReg Model (Cached)"
     else:
-        # Pre-calculated features (final_risk_features) are missing. Use a simplified heuristic score.
-        print("⚠️ Skipping complex internal model training due to missing FEATURES_COLLECTION.")
-        
+        # Use the Heuristic Score (Fallback)
         hard_brake_rate = target_features.get('hard_brake_rate_per_1000km', 0)
         high_speed_perc = target_features.get('percent_time_high_speed', 0)
         
@@ -378,22 +406,31 @@ def get_premium_estimates_for_api(user_data) -> dict:
         norm_speed = np.clip(high_speed_perc / 10.0, 0.0, 1.0)
         internal_risk_score = (norm_brake * 0.6) + (norm_speed * 0.4)
         internal_risk_score = float(np.clip(internal_risk_score, 0.1, 0.9))
+        model_source = "Heuristic Fallback"
 
-    # 4. Calculate Internal Premium
+    # 3. Calculate Internal Premium
     BASE_PREMIUM = 1000.0
     RISK_MULTIPLIER = 1.0 
     internal_premium = BASE_PREMIUM * (1 + internal_risk_score * RISK_MULTIPLIER)
 
-    # 5. CALL THE SIMULATED EXTERNAL API 
+    # 4. CALL THE SIMULATED EXTERNAL API 
     external_premium, external_message = get_simulated_premium(target_features)
     
+    # 5. Determine Claim History Status
+    has_claim_history = 0
+    if CLAIMS_DF is not None:
+        claim_row = CLAIMS_DF[CLAIMS_DF['deviceId'] == str(source_device_id)]
+        if not claim_row.empty:
+            has_claim_history = claim_row['has_claim'].iloc[0]
+            
     # 6. Prepare the API response structure
     return {
         "user_info": {
             "name": name,
             "device_id": device_id,
             "source_device_id": source_device_id,
-            "has_claim_history": bool(user_data.get('has_claim', 0))
+            "has_claim_history": bool(has_claim_history),
+            "model_source": model_source # Added for transparency
         },
         "telematics_features": {
             "total_distance_km": float(target_features['total_distance_km']),
@@ -414,7 +451,7 @@ def get_premium_estimates_for_api(user_data) -> dict:
     }
 
 
-# --- FLASK API ROUTES (ADDED TOP-LEVEL ERROR CATCHING) ---
+# --- FLASK API ROUTES (Unchanged, rely on refactored logic) ---
 
 @app.route('/login', methods=['POST'])
 def login_route():
@@ -446,7 +483,6 @@ def login_route():
         print(f"❌ Uncaught error in /login: {e}", file=sys.stderr)
         return jsonify({"status": "error", "code": 500, "message": "Internal server error during login"}), 500
 
-# NEW ROUTE: Handles user creation
 @app.route('/create_user', methods=['POST'])
 def create_user_route():
     """Handles new user creation."""
@@ -458,7 +494,6 @@ def create_user_route():
         username = data.get('username')
         password = data.get('password')
         name = data.get('name', username)
-        # Assign a unique placeholder device ID, and use a default existing source ID 
         device_id = data.get('device_id', 'NEW_USER_' + ''.join(random.choices(string.digits, k=5)))
         source_device_id = data.get('source_device_id', 'driver1') 
 
@@ -492,6 +527,7 @@ def get_features_route():
         device_id = data.get('device_id')
         source_device_id = data.get('source_device_id', device_id)
         
+        # This route still performs a real-time calculation because it should always return the freshest data
         features_df = calculate_all_features(device_id=device_id, source_device_id=source_device_id)
 
         if features_df is None or features_df.empty:
@@ -507,7 +543,6 @@ def get_features_route():
         return jsonify(features_dict), 200
         
     except Exception as e:
-        # This catches general runtime errors (like a Pandas calculation failure)
         print(f"❌ Uncaught error in /features route: {e}", file=sys.stderr)
         return jsonify({"status": "error", "code": 500, "message": f"Internal server error while calculating features: {e}"}), 500
 
@@ -528,7 +563,6 @@ def get_estimate_route():
         return jsonify(results), 200
         
     except Exception as e:
-        # This catches general runtime errors (like a merge failure or model training issue)
         print(f"❌ Uncaught error in /estimate route: {e}", file=sys.stderr)
         return jsonify({"status": "error", "code": 500, "message": f"Internal server error while generating estimate: {e}"}), 500
 
@@ -536,7 +570,12 @@ def get_estimate_route():
 if __name__ == '__main__':
     print("\n----------------------------------------------------")
     print("🚀 Telematics Risk Model API is STARTING...")
+    
+    # CRITICAL: Load data and train model once on startup
+    load_and_train_model_on_startup() 
+    
     print(f"MongoDB URI: {MONGO_URI}")
+    print(f"Data Load Status: {DATA_LOAD_STATUS}") # Report status
     print("Access the API at: http://127.0.0.1:5000/")
     print("----------------------------------------------------\n")
     app.run(debug=True)
