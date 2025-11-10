@@ -35,7 +35,18 @@ app = Flask(__name__)
 # --- CRITICAL STEP: CONFIGURE CORS (FIXED) ---
 # FIX: Using origins="*" allows local file testing (file://) and unknown origins 
 # to access the API. This resolves the browser's CORS block.
-CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
+CORS(
+    app, 
+    resources={
+        r"/*": {
+            "origins": [
+                "*", # This currently allows all origins, making the following explicit inclusion redundant *unless* you plan to change this later*
+                "https://wmhunt1.github.io/AutoInsuranceCalculatorUI"
+            ], 
+            "methods": ["GET", "POST", "OPTIONS"]
+        }
+    }
+)
 
 # --- CONFIGURATION (UNCHANGED) ---
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
