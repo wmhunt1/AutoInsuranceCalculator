@@ -52,8 +52,8 @@ DATABASE_NAME = "telematics_risk_db"
 USERS_COLLECTION = "users" 
 
 # Collections storing the modeling data
-TELEMATICS_COLLECTION = "TelematicsData" 
-CLAIMS_COLLECTION = "ClaimsHistory" 
+TELEMATICS_COLLECTION = "raw_telematics" 
+CLAIMS_COLLECTION = "claims_history" 
 FEATURES_COLLECTION = "RiskFeaturesFull"
 
 # --- UTILITY AND CORE LOGIC FUNCTIONS ---
